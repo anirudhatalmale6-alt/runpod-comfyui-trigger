@@ -13,7 +13,7 @@
 
 import { task, logger, AbortTaskRunError } from '@trigger.dev/sdk/v3';
 
-import { diagnose, type StorageProbeConfig, type ProbeResult } from '@/utils/storageDoctor';
+import { diagnose, configFromEnv, envNamesFor, type StorageProbeConfig, type ProbeResult } from '@/utils/storageDoctor';
 import { inspectVar, loggableReport } from '@/utils/envReport';
 
 export type StorageDoctorPayload = {
@@ -29,38 +29,6 @@ export type StorageDoctorResult = {
   notConfigured: string[];
 };
 
-/**
- * Both providers are read from environment variables, per environment, exactly
- * like the RunPod ones. Nothing is read from a file in the repo.
- */
-function configFor(
-  provider: 'tigris' | 'backblaze',
-  prefix: string | undefined,
-  probeWrite: boolean,
-): StorageProbeConfig | null {
-  const P = provider.toUpperCase();
-  const endpoint = process.env[`${P}_ENDPOINT`];
-  const bucket = process.env[`${P}_BUCKET`];
-  const accessKeyId = process.env[`${P}_ACCESS_KEY_ID`];
-  const secretAccessKey = process.env[`${P}_SECRET_ACCESS_KEY`];
-  const region = process.env[`${P}_REGION`];
-
-  if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) return null;
-
-  return {
-    provider,
-    label: provider,
-    endpoint,
-    bucket,
-    accessKeyId,
-    secretAccessKey,
-    // Tigris uses "auto"; Backblaze REQUIRES the region to match the endpoint.
-    region: region ?? (provider === 'tigris' ? 'auto' : 'us-west-004'),
-    prefix,
-    probeWrite,
-  };
-}
-
 export const storageDoctor = task({
   id: 'storage-doctor',
   retry: { maxAttempts: 1 },
@@ -68,17 +36,17 @@ export const storageDoctor = task({
     const prefix = payload?.prefix;
     const probeWrite = payload?.probeWrite === true;
 
+    // Both spellings are accepted: the *_AWS_* / *_BUCKET_NAME names this
+    // project actually uses, and the shorter fallbacks.
     const vars = [
-      'TIGRIS_ENDPOINT',
-      'TIGRIS_BUCKET',
-      'TIGRIS_ACCESS_KEY_ID',
-      'TIGRIS_SECRET_ACCESS_KEY',
-      'TIGRIS_REGION',
-      'BACKBLAZE_ENDPOINT',
-      'BACKBLAZE_BUCKET',
-      'BACKBLAZE_ACCESS_KEY_ID',
-      'BACKBLAZE_SECRET_ACCESS_KEY',
-      'BACKBLAZE_REGION',
+      'TIGRIS_ENDPOINT', 'TIGRIS_REGION',
+      'TIGRIS_AWS_ACCESS_KEY_ID', 'TIGRIS_ACCESS_KEY_ID',
+      'TIGRIS_AWS_SECRET_ACCESS_KEY', 'TIGRIS_SECRET_ACCESS_KEY',
+      'TIGRIS_BUCKET_NAME', 'TIGRIS_BUCKET',
+      'BACKBLAZE_ENDPOINT', 'BACKBLAZE_REGION',
+      'BACKBLAZE_AWS_ACCESS_KEY_ID', 'BACKBLAZE_ACCESS_KEY_ID',
+      'BACKBLAZE_AWS_SECRET_ACCESS_KEY', 'BACKBLAZE_SECRET_ACCESS_KEY',
+      'BACKBLAZE_BUCKET_NAME', 'BACKBLAZE_BUCKET',
     ].map((n) => inspectVar(n));
 
     logger.info('storage doctor: environment', {
@@ -93,7 +61,7 @@ export const storageDoctor = task({
     const notConfigured: string[] = [];
 
     for (const provider of ['tigris', 'backblaze'] as const) {
-      const config = configFor(provider, prefix, probeWrite);
+      const config = configFromEnv(provider, { prefix, probeWrite });
       if (config) configs.push(config);
       else notConfigured.push(provider);
     }
@@ -101,9 +69,10 @@ export const storageDoctor = task({
     if (configs.length === 0) {
       throw new AbortTaskRunError(
         `Neither Tigris nor Backblaze is configured in the ${ctx.environment.type} environment. ` +
-          `Each needs <PROVIDER>_ENDPOINT, _BUCKET, _ACCESS_KEY_ID and _SECRET_ACCESS_KEY ` +
-          `(TIGRIS_* and BACKBLAZE_*), set under Project Settings > Environment Variables ` +
-          `with ${ctx.environment.type} ticked.`,
+          `tigris is missing: ${envNamesFor('tigris').missing.join('; ')}. ` +
+          `backblaze is missing: ${envNamesFor('backblaze').missing.join('; ')}. ` +
+          `Set them under Project Settings > Environment Variables with ` +
+          `${ctx.environment.type} ticked.`,
       );
     }
 

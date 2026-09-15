@@ -263,3 +263,77 @@ export async function diagnose(config: StorageProbeConfig): Promise<ProbeResult>
 
   return finish('unknown');
 }
+
+
+/**
+ * Read provider configuration from the environment.
+ *
+ * Reads the names THIS PROJECT actually uses — `TIGRIS_AWS_ACCESS_KEY_ID`,
+ * `TIGRIS_BUCKET_NAME` and friends, as seen in src/utils/storageClient.ts — and
+ * falls back to the shorter `TIGRIS_ACCESS_KEY_ID` / `TIGRIS_BUCKET` spellings.
+ *
+ * Getting this wrong is not harmless: a diagnostic that reads the wrong variable
+ * names reports "not configured" against a perfectly configured environment, and
+ * sends you hunting for a problem that is not there.
+ */
+export function configFromEnv(
+  provider: 'tigris' | 'backblaze',
+  options: { prefix?: string; probeWrite?: boolean } = {},
+  env: NodeJS.ProcessEnv = process.env,
+): StorageProbeConfig | null {
+  const P = provider.toUpperCase();
+  const pick = (...names: string[]): string | undefined => {
+    for (const name of names) {
+      const value = env[name];
+      if (value && value.trim().length > 0) return value.trim();
+    }
+    return undefined;
+  };
+
+  const accessKeyId = pick(`${P}_AWS_ACCESS_KEY_ID`, `${P}_ACCESS_KEY_ID`);
+  const secretAccessKey = pick(`${P}_AWS_SECRET_ACCESS_KEY`, `${P}_SECRET_ACCESS_KEY`);
+  const bucket = pick(`${P}_BUCKET_NAME`, `${P}_BUCKET`);
+  const region = pick(`${P}_REGION`);
+  const endpoint =
+    pick(`${P}_ENDPOINT`) ??
+    (provider === 'tigris'
+      ? 'https://fly.storage.tigris.dev'
+      : `https://s3.${region ?? 'us-west-004'}.backblazeb2.com`);
+
+  if (!accessKeyId || !secretAccessKey || !bucket) return null;
+
+  return {
+    provider,
+    label: provider,
+    endpoint,
+    bucket,
+    accessKeyId,
+    secretAccessKey,
+    region: region ?? (provider === 'tigris' ? 'auto' : 'us-west-004'),
+    // Mirror the real clients: Tigris virtual-hosted, Backblaze path-style.
+    forcePathStyle: provider === 'backblaze',
+    ...(options.prefix ? { prefix: options.prefix } : {}),
+    probeWrite: options.probeWrite ?? false,
+  };
+}
+
+/** Which env var names were actually found, for reporting. Values never included. */
+export function envNamesFor(provider: 'tigris' | 'backblaze', env: NodeJS.ProcessEnv = process.env): {
+  found: string[];
+  missing: string[];
+} {
+  const P = provider.toUpperCase();
+  const groups: Array<[string, string[]]> = [
+    ['access key', [`${P}_AWS_ACCESS_KEY_ID`, `${P}_ACCESS_KEY_ID`]],
+    ['secret', [`${P}_AWS_SECRET_ACCESS_KEY`, `${P}_SECRET_ACCESS_KEY`]],
+    ['bucket', [`${P}_BUCKET_NAME`, `${P}_BUCKET`]],
+  ];
+  const found: string[] = [];
+  const missing: string[] = [];
+  for (const [, names] of groups) {
+    const hit = names.find((n) => env[n] && env[n]!.trim().length > 0);
+    if (hit) found.push(hit);
+    else missing.push(names.join(" or "));
+  }
+  return { found, missing };
+}

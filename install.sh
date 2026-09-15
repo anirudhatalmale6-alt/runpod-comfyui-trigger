@@ -74,6 +74,22 @@ fi
 echo ""
 echo "  $INSTALLED source file(s) installed"
 
+# Scripts too. These were missed entirely on the first pass, which is why
+# scripts/storage-doctor.mjs "did not exist" in the target repo despite being in
+# this package. Same lesson as the source list: enumerate, do not hand-write.
+mkdir -p "$TARGET/scripts"
+SCRIPTS=0
+for from in $(find "$HERE/scripts" -type f \( -name '*.mjs' -o -name '*.sh' \) 2>/dev/null | sort); do
+  to="$TARGET/scripts/$(basename "$from")"
+  copy "$from" "$to"
+  chmod +x "$to" 2>/dev/null || true
+  SCRIPTS=$((SCRIPTS + 1))
+done
+if [ "$SCRIPTS" -gt 0 ]; then
+  echo ""
+  echo "  $SCRIPTS script(s) installed into scripts/"
+fi
+
 if [ ! -f "$TARGET/.env.example" ]; then
   cp "$HERE/.env.example" "$TARGET/.env.example"
   echo "  installed .env.example (placeholders only)"

@@ -19,40 +19,24 @@
  * this from inside your project after install.sh.
  */
 
-import { diagnose } from '../src/utils/storageDoctor.ts';
+import { diagnose, configFromEnv, envNamesFor } from '../src/utils/storageDoctor.ts';
 
 const PREFIX = process.env.PREFIX || undefined;
 const PROBE_WRITE = process.env.PROBE_WRITE === '1';
 
-function configFor(provider) {
-  const P = provider.toUpperCase();
-  const endpoint = process.env[`${P}_ENDPOINT`];
-  const bucket = process.env[`${P}_BUCKET`];
-  const accessKeyId = process.env[`${P}_ACCESS_KEY_ID`];
-  const secretAccessKey = process.env[`${P}_SECRET_ACCESS_KEY`];
-  const region = process.env[`${P}_REGION`];
-  if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) return null;
-  return {
-    provider,
-    label: provider,
-    endpoint,
-    bucket,
-    accessKeyId,
-    secretAccessKey,
-    region: region ?? (provider === 'tigris' ? 'auto' : 'us-west-004'),
-    prefix: PREFIX,
-    probeWrite: PROBE_WRITE,
-  };
-}
-
 const providers = ['tigris', 'backblaze'];
-const configured = providers.map(configFor).filter(Boolean);
+const configured = providers
+  .map((p) => configFromEnv(p, { prefix: PREFIX, probeWrite: PROBE_WRITE }))
+  .filter(Boolean);
 
 if (configured.length === 0) {
   console.error('');
-  console.error('Nothing to probe. Set at least one provider:');
-  console.error('  TIGRIS_ENDPOINT, TIGRIS_BUCKET, TIGRIS_ACCESS_KEY_ID, TIGRIS_SECRET_ACCESS_KEY');
-  console.error('  BACKBLAZE_ENDPOINT, BACKBLAZE_BUCKET, BACKBLAZE_ACCESS_KEY_ID, BACKBLAZE_SECRET_ACCESS_KEY');
+  console.error('Nothing to probe. Missing, per provider:');
+  for (const p of providers) {
+    const { found, missing } = envNamesFor(p);
+    console.error(`  ${p}: missing ${missing.join(', ')}`);
+    if (found.length) console.error(`         (found ${found.join(', ')})`);
+  }
   console.error('');
   process.exit(2);
 }
