@@ -1,0 +1,8 @@
+{
+  "_comment": "Your package.json has NO scripts block, so `npm run build` fails with 'Missing script: build'. Merge this in.",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "deploy": "bash scripts/deploy.sh"
+  }
+}
