@@ -22,6 +22,12 @@ import {
   type RunPodConfig,
   type StatusResponse,
 } from '@/utils/runpodClient';
+import {
+  validateWorkflow,
+  availableModelsFromEnv,
+  extractAvailableFromError,
+  type AvailableModels,
+} from '@/utils/workflowValidator';
 
 export type RevenueGatePayload = {
   /**
@@ -37,6 +43,14 @@ export type RevenueGatePayload = {
    * settings, and so on). Merged into `input` next to `workflow`.
    */
   extraInput?: Record<string, unknown>;
+  /**
+   * Models this endpoint actually carries, so a graph naming a model it does
+   * not have is rejected locally instead of after a GPU cold start.
+   *
+   * Overrides RUNPOD_AVAILABLE_CHECKPOINTS and friends. A field left out is not
+   * checked at all — silence means "not told", never "nothing available".
+   */
+  availableModels?: AvailableModels;
   /** Optional per-run override of the polling deadline. */
   deadlineSeconds?: number;
   /**
@@ -136,6 +150,24 @@ export const revenueGateRouter = task({
       );
     }
 
+    // --- 0. validate the graph locally, before spending anything ---------
+    //
+    // A graph naming a model the worker image lacks is rejected by ComfyUI's
+    // own validator, but only AFTER the container is up. A real run of ours
+    // spent 22.5s of queue plus 2.6s of execution to learn that. This check is
+    // free and instant, so it happens first.
+    const availableModels = payload.availableModels ?? availableModelsFromEnv();
+    const workflowProblems = validateWorkflow(payload.workflow, availableModels);
+
+    if (workflowProblems.length > 0) {
+      logger.error('Workflow rejected before submission', { problems: workflowProblems });
+      throw new AbortTaskRunError(
+        `Workflow references ${workflowProblems.length} model(s) this endpoint does not have, ` +
+          `so it was NOT submitted and no GPU time was used:\n` +
+          workflowProblems.map((p) => `  • ${p.message}`).join('\n'),
+      );
+    }
+
     // --- 1. submit -------------------------------------------------------
     // Body becomes {"input": {...extraInput, "workflow": {...}}}.
     // workflow is spread LAST so extraInput can never clobber it.
@@ -196,7 +228,19 @@ export const revenueGateRouter = task({
       // error text attached rather than swallowed.
       const detail =
         terminal.error === undefined ? '(no error detail returned)' : JSON.stringify(terminal.error);
-      const message = `RunPod job ${terminal.id} ended as ${terminal.status}: ${detail}`;
+      let message = `RunPod job ${terminal.id} ended as ${terminal.status}: ${detail}`;
+
+      // ComfyUI's validation errors name the models the endpoint DOES have.
+      // Surface that as config the caller can paste in, so the same cold start
+      // is never paid for twice.
+      const learned = extractAvailableFromError(terminal.error);
+      if (learned.length > 0 && Object.keys(availableModels).length === 0) {
+        message +=
+          `\n\nThis endpoint reports these models available: ${learned.join(', ')}. ` +
+          `Set RUNPOD_AVAILABLE_CHECKPOINTS to that list (or pass payload.availableModels) ` +
+          `and a graph naming anything else will be rejected locally, before it costs a cold start.`;
+        logger.info('Learned available models from the failure', { available: learned });
+      }
 
       // AbortTaskRunError by default, so Trigger.dev does NOT retry. A retry
       // would submit a fresh RunPod job and bill another cold start, and a

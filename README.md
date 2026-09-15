@@ -27,11 +27,12 @@ see "What I cannot do" below before reading anything else here as finished.
 | file | what it is |
 | --- | --- |
 | `src/utils/runpodClient.ts` | RunPod v2 client + polling loop. No Trigger.dev import, so it is testable standalone. |
+| `src/utils/workflowValidator.ts` | Pre-submission graph validation. Rejects a model the endpoint lacks BEFORE any GPU spend. |
 | `src/utils/envReport.ts` | Environment-variable inspection. Presence, length and shape — never values. |
 | `src/trigger/revenueGateRouter.ts` | The task. Supplies `wait.for` to the poller and resolves terminal states. |
 | `src/trigger/configDoctor.ts` | Zero-cost diagnostic task. Reports what the runtime can see, no GPU job. |
 | `test/mockRunpod.ts` | A mock RunPod endpoint: enforces the Bearer token and the `input` wrapper, walks jobs IN_QUEUE → IN_PROGRESS → terminal, and can inject 401s / 500s / malformed bodies. |
-| `test/runpod.test.ts`, `test/envReport.test.ts` | 42 tests, all passing. |
+| `test/*.test.ts` | 58 tests, all passing. |
 | `config/trigger.config.ts` | Updated config — see the `maxDuration` note. |
 | `config/package.scripts.json` | The `scripts` block to merge, because yours has none. |
 | `.env.example` | Placeholders only. |
@@ -39,7 +40,7 @@ see "What I cannot do" below before reading anything else here as finished.
 ## Verified
 
 ```
-npm test                            42 passed, 0 failed
+npm test                            58 passed, 0 failed
 tsc --noEmit                        clean, inside your real tsconfig
 esbuild (CLI's own build options)   BUILD OK, warnings: none
                                     src/utils/runpodClient.ts bundled via the
@@ -195,7 +196,7 @@ Stated plainly, because your escrow gate depends on it.
 
 So everything in Phase 3 and the acceptance screenshot are yours to run. What I
 can do is make sure that when you run them, they work — which is what the mock
-server and the 42 tests are for. If any of them fails, paste the output and I
+server and the 58 tests are for. If any of them fails, paste the output and I
 will fix it.
 
 ## What is not tested
@@ -238,3 +239,53 @@ asserting no value can leak into the log projection.
 `revenueGateRouter` now names the environment in its own abort message too, and
 lists which required variables *are* set, so a half-configured environment is
 obvious from the failure alone.
+
+
+## CONFIRMED LIVE (15/09, production trace)
+
+The first real end-to-end run settled every open question about this code:
+
+| claim | evidence in the trace |
+| --- | --- |
+| No duplicate submission | `RunPod job submitted` appears **once**; `Attempt 1` only, no Attempt 2 |
+| `wait.for` does not replay `run()` | job id identical across all 5 polls |
+| Backoff works | polls at 0s, 5s, 10s, 20s, 30s — gaps of 5, 5, 10, 10 |
+| Suspension works | `wait.for()` spans of 5s, 5s, 10s, 10.1s |
+| `AbortTaskRunError` stops the retry | one attempt, one GPU job, no resubmission |
+| `config-doctor` works | `ok: true`, PRODUCTION, both vars present |
+
+The duplicate-GPU-billing risk I had been flagging since before the first deploy
+is now **closed, by evidence rather than by argument**.
+
+## Pre-submission workflow validation
+
+That same run failed — but not on anything here. ComfyUI rejected the graph:
+
+```
+ckpt_name: 'v1-5-pruned-emaonly.ckpt' not in ['flux1-dev-fp8.safetensors']
+Available checkpoint models: flux1-dev-fp8.safetensors
+```
+
+It cost **22.5s of queue and 2.6s of execution** to be told something knowable for
+free. `src/utils/workflowValidator.ts` now checks the graph locally first:
+
+```ts
+await revenueGateRouter.trigger({
+  workflow: graph,
+  availableModels: { ckpt_name: ['flux1-dev-fp8.safetensors'] },
+})
+```
+
+or set `RUNPOD_AVAILABLE_CHECKPOINTS=flux1-dev-fp8.safetensors` once in
+Trigger.dev and every run is checked automatically. A graph naming anything else
+is rejected **before submission, with no GPU time used at all**.
+
+Two deliberate properties:
+
+- **Silence means "not told", never "nothing available".** A model field with no
+  configured list is not checked, so this can never invent a failure for a lora
+  or VAE you simply never told me about.
+- **The first failure teaches the list.** When a job fails and no list is
+  configured, the abort message parses ComfyUI's own error and hands back the
+  exact `RUNPOD_AVAILABLE_CHECKPOINTS` value to paste in — so the same cold start
+  is never paid for twice.
