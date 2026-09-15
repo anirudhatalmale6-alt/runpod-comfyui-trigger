@@ -219,18 +219,30 @@ export const weeklyStorageSweeper = schedules.task({
       { dryRun },
     );
 
+    // Passed as an explicit object literal, not `result` itself: logger's
+    // second argument is Record<string, unknown>, and an `interface` does not
+    // satisfy that (no implicit index signature). Passing the interface value
+    // directly is a TS2345 compile error.
+    const summary = {
+      scanned: result.scanned,
+      migrated: result.migrated,
+      deleted: result.deleted,
+      dryRun: result.dryRun,
+      failedCount: result.failed.length,
+    };
+
     if (result.dryRun) {
       logger.warn(
         `DRY RUN — ${result.migrated} of ${result.scanned} object(s) were copied to cold and ` +
           `size-verified, and NOTHING was deleted from hot storage. ` +
           `Set STORAGE_SWEEP_DRY_RUN=false to enable deletion.`,
-        result,
+        summary,
       );
     } else {
       logger.info(
         `Live sweep — ${result.migrated} copied, ${result.deleted} deleted from hot, ` +
           `${result.failed.length} failed.`,
-        result,
+        summary,
       );
     }
 
