@@ -95,20 +95,29 @@ losing a job that was about to complete.
 
 > `maxDuration` must comfortably exceed the `deadlineSeconds` given to the task.
 
-**Open question I could not settle from the installed packages:** whether time
-spent inside `wait.for` counts toward `maxDuration`, or whether `maxDuration` is
-compute time only and suspended waits are excluded. The config above is safe
-either way, which is why I set it rather than waiting for the answer — but if
-you know, tell me and I will tune it properly instead of over-provisioning.
+**ANSWERED by the client (15/09):** on Trigger.dev v3 Cloud, `maxDuration`
+measures active CPU compute only — time suspended inside `wait.for` is frozen and
+does not count against it. So `maxDuration: 3600` is over-provisioned but
+harmless, and more usefully **raising `deadlineSeconds` past 600 is cheap**. The
+only thing a longer deadline costs is wall-clock latency before a stuck job gives
+up, so if ComfyUI cold starts run long, raise it without worrying — per run via
+`payload.deadlineSeconds`, or change the default in `revenueGateRouter.ts`.
 
 ## Installing
 
 ```bash
-cp src/utils/runpodClient.ts        "$REPO/src/utils/"
-cp src/trigger/revenueGateRouter.ts "$REPO/src/trigger/"
-cp .env.example                     "$REPO/.env.example"
+bash install.sh /path/to/your/repo
+```
+
+It copies the source files in, backs up anything it would overwrite, and refuses
+a directory with no `package.json`. Three things it deliberately leaves to you,
+because they need your values:
+
+```
 # merge config/package.scripts.json into your package.json
+#   (without it, `npm run build` fails with "Missing script: build")
 # replace proj_YOUR_PROJECT_REF in config/trigger.config.ts, then copy it over
+# set RUNPOD_API_KEY and RUNPOD_ENDPOINT_ID in Trigger.dev, per environment
 ```
 
 Then set `RUNPOD_API_KEY` and `RUNPOD_ENDPOINT_ID` in Trigger.dev under
@@ -136,7 +145,7 @@ Stated plainly, because your escrow gate depends on it.
 
 So everything in Phase 3 and the acceptance screenshot are yours to run. What I
 can do is make sure that when you run them, they work — which is what the mock
-server and the 27 tests are for. If any of them fails, paste the output and I
+server and the 39 tests are for. If any of them fails, paste the output and I
 will fix it.
 
 ## What is not tested
