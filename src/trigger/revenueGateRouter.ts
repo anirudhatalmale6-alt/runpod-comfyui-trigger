@@ -51,18 +51,31 @@ export type RevenueGateResult = {
  * AbortTaskRunError — retrying it six times would just produce six identical
  * failures and obscure the real message.
  */
-function loadConfig(): RunPodConfig {
+function loadConfig(environmentLabel: string): RunPodConfig {
   const apiKey = process.env.RUNPOD_API_KEY;
   const endpointId = process.env.RUNPOD_ENDPOINT_ID;
 
   const missing: string[] = [];
-  if (!apiKey) missing.push('RUNPOD_API_KEY');
-  if (!endpointId) missing.push('RUNPOD_ENDPOINT_ID');
+  const present: string[] = [];
+  (
+    [
+      ['RUNPOD_API_KEY', apiKey],
+      ['RUNPOD_ENDPOINT_ID', endpointId],
+    ] as const
+  ).forEach(([name, value]) => (value ? present.push(name) : missing.push(name)));
 
   if (missing.length > 0) {
+    // Naming the environment matters: Trigger.dev environment variables are
+    // scoped per environment, so the usual cause of this error is the value
+    // being set in DEVELOPMENT while the run happened in PRODUCTION. Listing
+    // what IS present makes a partial setup obvious at a glance.
     throw new AbortTaskRunError(
       `Missing required environment variable(s): ${missing.join(', ')}. ` +
-        `Set them in Trigger.dev under Project Settings > Environment Variables for this environment.`,
+        `This run executed in the ${environmentLabel} environment` +
+        (present.length > 0 ? `, where ${present.join(' and ')} ${present.length === 1 ? 'is' : 'are'} set` : '') +
+        `. Trigger.dev environment variables are per-environment: set them under ` +
+        `Project Settings > Environment Variables and make sure ${environmentLabel} is ticked, ` +
+        `not just Development.`,
     );
   }
 
@@ -83,8 +96,8 @@ export const revenueGateRouter = task({
     maxTimeoutInMs: 30_000,
     factor: 2,
   },
-  run: async (payload: RevenueGatePayload): Promise<RevenueGateResult> => {
-    const config = loadConfig();
+  run: async (payload: RevenueGatePayload, { ctx }): Promise<RevenueGateResult> => {
+    const config = loadConfig(ctx.environment.type);
 
     if (!payload?.prompt || typeof payload.prompt !== 'object') {
       throw new AbortTaskRunError(

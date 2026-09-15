@@ -27,9 +27,11 @@ see "What I cannot do" below before reading anything else here as finished.
 | file | what it is |
 | --- | --- |
 | `src/utils/runpodClient.ts` | RunPod v2 client + polling loop. No Trigger.dev import, so it is testable standalone. |
+| `src/utils/envReport.ts` | Environment-variable inspection. Presence, length and shape — never values. |
 | `src/trigger/revenueGateRouter.ts` | The task. Supplies `wait.for` to the poller and resolves terminal states. |
+| `src/trigger/configDoctor.ts` | Zero-cost diagnostic task. Reports what the runtime can see, no GPU job. |
 | `test/mockRunpod.ts` | A mock RunPod endpoint: enforces the Bearer token and the `input` wrapper, walks jobs IN_QUEUE → IN_PROGRESS → terminal, and can inject 401s / 500s / malformed bodies. |
-| `test/runpod.test.ts` | 27 tests, all passing. |
+| `test/runpod.test.ts`, `test/envReport.test.ts` | 39 tests, all passing. |
 | `config/trigger.config.ts` | Updated config — see the `maxDuration` note. |
 | `config/package.scripts.json` | The `scripts` block to merge, because yours has none. |
 | `.env.example` | Placeholders only. |
@@ -37,7 +39,7 @@ see "What I cannot do" below before reading anything else here as finished.
 ## Verified
 
 ```
-node --test test/runpod.test.ts     27 passed, 0 failed
+npm test                            39 passed, 0 failed
 tsc --noEmit                        clean, inside your real tsconfig
 esbuild (CLI's own build options)   BUILD OK, warnings: none
                                     src/utils/runpodClient.ts bundled via the
@@ -150,3 +152,26 @@ will fix it.
   instantly. The call signature is verified against the installed SDK 3.3.17
   (`wait.for({ seconds })`), and it typechecks, but its runtime behaviour under
   Trigger.dev is unproven until you deploy.
+
+
+## configDoctor — run this when a run fails on configuration
+
+Trigger `config-doctor` from the test console. It submits no RunPod job and
+spends no GPU time. It answers the three things behind nearly every "but I did
+set it":
+
+1. **Which environment did this actually run in?** Trigger.dev environment
+   variables are scoped per environment — a value set in Development is simply
+   not present in Production. Every message names the environment.
+2. **Is the variable there at all?**
+3. **Is it there but empty, or padded with whitespace from a paste?** A trailing
+   newline on an API key goes into the `Authorization` header verbatim and gets
+   rejected, which looks like a bad key rather than a bad paste.
+
+It never logs a value — only name, presence and character count. The length is
+usually enough to spot a truncated paste on its own, and there is a test
+asserting no value can leak into the log projection.
+
+`revenueGateRouter` now names the environment in its own abort message too, and
+lists which required variables *are* set, so a half-configured environment is
+obvious from the failure alone.
