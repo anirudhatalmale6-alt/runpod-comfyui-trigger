@@ -70,6 +70,10 @@ export interface SweepOptions {
   maxObjects?: number;
 }
 
+function describeBucket(): string {
+  return process.env.TIGRIS_BUCKET_NAME ?? "(TIGRIS_BUCKET_NAME not set)";
+}
+
 function asReadable(body: unknown, key: string): Readable {
   if (!(body instanceof Readable)) {
     throw new Error(`Tigris returned a non-readable body for ${key}`);
@@ -199,6 +203,64 @@ export function sweepDryRunFromEnv(env: NodeJS.ProcessEnv = process.env): boolea
   return (env.STORAGE_SWEEP_DRY_RUN ?? "").trim().toLowerCase() !== "false";
 }
 
+/**
+ * Log the resolved storage configuration at the start of every run.
+ *
+ * None of this is secret — endpoints, regions and bucket names are all public
+ * identifiers — and having it in the trace means ONE run tells you whether the
+ * config is right, instead of a round trip per guess. Access keys are reported
+ * only as present/absent with a length.
+ */
+function logResolvedConfig(): void {
+  const describe = (name: string) => {
+    const raw = process.env[name];
+    if (raw === undefined) return "(not set)";
+    if (raw.trim() === "") return "(EMPTY STRING - note ?? does not fall back on this)";
+    return raw;
+  };
+  const secret = (...names: string[]) => {
+    for (const n of names) {
+      const v = process.env[n];
+      if (v && v.trim() !== "") return `${n} set, length ${v.length}`;
+    }
+    return `NOT SET (looked for ${names.join(", ")})`;
+  };
+  // An endpoint that is not an absolute URL makes the AWS SDK throw a bare
+  // "TypeError: Invalid URL" on first use, with nothing naming the endpoint.
+  const endpointNote = (value: string) => {
+    if (value.startsWith("(")) return "";
+    try {
+      const u = new URL(value.trim());
+      return u.protocol === "https:" || u.protocol === "http:" ? " [ok]" : ` [BAD SCHEME ${u.protocol}]`;
+    } catch {
+      return " [NOT A URL - needs the https:// prefix]";
+    }
+  };
+
+  const tigrisEndpoint = describe("TIGRIS_ENDPOINT");
+  const backblazeEndpoint = describe("BACKBLAZE_ENDPOINT");
+
+  logger.info("Storage configuration in use", {
+    tigris: {
+      endpoint: tigrisEndpoint + endpointNote(tigrisEndpoint),
+      region: describe("TIGRIS_REGION"),
+      bucket: describe("TIGRIS_BUCKET_NAME"),
+      credentials: secret("TIGRIS_AWS_ACCESS_KEY_ID", "TIGRIS_ACCESS_KEY_ID"),
+    },
+    backblaze: {
+      endpoint: backblazeEndpoint + endpointNote(backblazeEndpoint),
+      region: describe("BACKBLAZE_REGION"),
+      bucket: describe("BACKBLAZE_BUCKET_NAME"),
+      credentials: secret("BACKBLAZE_AWS_ACCESS_KEY_ID", "BACKBLAZE_ACCESS_KEY_ID"),
+    },
+    dryRun: sweepDryRunFromEnv(),
+    patchVersion: PATCH_VERSION,
+  });
+}
+
+/** Bumped whenever this file changes, so a trace proves which version ran. */
+export const PATCH_VERSION = "sweeper-patch-2 (self-diagnosing)";
+
 export const weeklyStorageSweeper = schedules.task({
   id: "weekly-storage-sweeper",
   cron: {
@@ -206,6 +268,11 @@ export const weeklyStorageSweeper = schedules.task({
     timezone: "UTC",
   },
   run: async (): Promise<SweepResult> => {
+    // Always logs, first thing, before anything can fail. If you do not see
+    // "Storage configuration in use" in the trace, this file is not the one
+    // that is deployed.
+    logResolvedConfig();
+
     const dryRun = sweepDryRunFromEnv();
 
     const result = await sweepStorage(
@@ -247,7 +314,23 @@ export const weeklyStorageSweeper = schedules.task({
     }
 
     if (result.failed.length > 0) {
-      logger.error(`${result.failed.length} object(s) failed to migrate`, { failed: result.failed });
+      // One line per failure with the key and the real error text, so a single
+      // trace is enough to diagnose without another round trip.
+      for (const item of result.failed) {
+        logger.error(`FAILED: ${item.key} — ${item.error}`, { key: item.key, error: item.error });
+      }
+    } else if (result.scanned === 0) {
+      logger.warn(
+        `Nothing to sweep: the hot bucket "${describeBucket()}" is empty, or ` +
+          `TIGRIS_BUCKET_NAME points at a different bucket from the one holding your renders.`,
+      );
+    } else if (result.migrated === result.scanned) {
+      logger.info(
+        `PASS — all ${result.scanned} object(s) copied to cold and size-verified.` +
+          (result.dryRun
+            ? ` Still in dry run, so nothing was deleted. Set STORAGE_SWEEP_DRY_RUN=false to finish.`
+            : ` ${result.deleted} removed from hot.`),
+      );
     }
 
     return result;
