@@ -28,11 +28,14 @@ see "What I cannot do" below before reading anything else here as finished.
 | --- | --- |
 | `src/utils/runpodClient.ts` | RunPod v2 client + polling loop. No Trigger.dev import, so it is testable standalone. |
 | `src/utils/workflowValidator.ts` | Pre-submission graph validation. Rejects a model the endpoint lacks BEFORE any GPU spend. |
+| `src/utils/storageDoctor.ts` | S3 diagnosis. Distinguishes the five different causes of AccessDenied. |
+| `src/trigger/storageDoctorTask.ts` | `storage-doctor` task — probes Tigris and Backblaze, read-only, no GPU. |
+| `scripts/storage-doctor.mjs` | The same diagnosis run locally, no deploy needed. |
 | `src/utils/envReport.ts` | Environment-variable inspection. Presence, length and shape — never values. |
 | `src/trigger/revenueGateRouter.ts` | The task. Supplies `wait.for` to the poller and resolves terminal states. |
 | `src/trigger/configDoctor.ts` | Zero-cost diagnostic task. Reports what the runtime can see, no GPU job. |
 | `test/mockRunpod.ts` | A mock RunPod endpoint: enforces the Bearer token and the `input` wrapper, walks jobs IN_QUEUE → IN_PROGRESS → terminal, and can inject 401s / 500s / malformed bodies. |
-| `test/*.test.ts` | 58 tests, all passing. |
+| `test/*.test.ts` | 71 tests, all passing. |
 | `config/trigger.config.ts` | Updated config — see the `maxDuration` note. |
 | `config/package.scripts.json` | The `scripts` block to merge, because yours has none. |
 | `.env.example` | Placeholders only. |
@@ -40,7 +43,7 @@ see "What I cannot do" below before reading anything else here as finished.
 ## Verified
 
 ```
-npm test                            58 passed, 0 failed
+npm test                            71 passed, 0 failed
 tsc --noEmit                        clean, inside your real tsconfig
 esbuild (CLI's own build options)   BUILD OK, warnings: none
                                     src/utils/runpodClient.ts bundled via the
@@ -196,7 +199,7 @@ Stated plainly, because your escrow gate depends on it.
 
 So everything in Phase 3 and the acceptance screenshot are yours to run. What I
 can do is make sure that when you run them, they work — which is what the mock
-server and the 58 tests are for. If any of them fails, paste the output and I
+server and the 71 tests are for. If any of them fails, paste the output and I
 will fix it.
 
 ## What is not tested
@@ -289,3 +292,67 @@ Two deliberate properties:
   configured, the abort message parses ComfyUI's own error and hands back the
   exact `RUNPOD_AVAILABLE_CHECKPOINTS` value to paste in — so the same cold start
   is never paid for twice.
+
+
+## Diagnosing S3 AccessDenied (Tigris / Backblaze B2)
+
+`AccessDenied` on `ListObjectsV2` is one error code covering at least five
+different problems, and guessing between them costs a deploy cycle each time.
+
+Run the diagnosis locally — no deploy, no GPU, read-only:
+
+```bash
+TIGRIS_ENDPOINT=... TIGRIS_BUCKET=... TIGRIS_ACCESS_KEY_ID=... TIGRIS_SECRET_ACCESS_KEY=... \
+PREFIX=renders/ node scripts/storage-doctor.mjs
+```
+
+or deploy and trigger the `storage-doctor` task, which reads the same variables
+from Trigger.dev.
+
+It reports one of:
+
+| verdict | what it means |
+| --- | --- |
+| `ok` | listing works with these credentials, bucket and prefix |
+| `credentials_missing` | the key or secret is empty |
+| `credentials_rejected` | endpoint does not know this key — usually the two providers' keys crossed over |
+| `signature_mismatch` | wrong secret, a pasted newline, or wrong region for the endpoint |
+| `bucket_missing` | no such bucket at this endpoint |
+| `no_list_permission` | valid key, but not allowed to enumerate. **The most common cause.** |
+| `no_list_permission_or_prefix_restricted` | denied at the prefix *and* at the root — genuinely ambiguous, and it says so instead of guessing |
+| `endpoint_unreachable` | host did not resolve or refused |
+
+### Provider settings that actually matter
+
+- **Backblaze B2** — the region must match the endpoint exactly:
+  `us-west-004` with `https://s3.us-west-004.backblazeb2.com`. A mismatch gives
+  `SignatureDoesNotMatch`, not a helpful message. An application key needs the
+  **`listFiles`** capability; a key created for read-only object access can
+  `GetObject` a known key but cannot list. B2 keys can also be restricted to a
+  single bucket and a name prefix — listing outside either is `AccessDenied`.
+- **Tigris** — region is `auto`. The key needs list permission on the bucket.
+- **Keys must never have a leading `/`.** `"/renders/x.png"` is a key literally
+  beginning with a slash, a different object from `"renders/x.png"`, and it makes
+  prefix listings silently return nothing.
+
+### How this was verified
+
+Against a **real S3 server** — MinIO in a container, with real IAM policies —
+not a mock. Nine scenarios driven end to end: working credentials, a key with no
+list permission, a prefix-scoped key inside and outside its prefix, a missing
+bucket, a bad access key, a bad secret, empty credentials, and a refused
+endpoint. All nine classify correctly.
+
+That run found **two real defects** in the classifier that a mock would have
+happily confirmed:
+
+1. A refused connection surfaces from the AWS SDK as error name `"Error"`, not
+   `ECONNREFUSED` — the cause is only in the message. It was being reported as
+   `unknown`.
+2. A prefix-scoped key is denied on the bucket **root** as well, so "root
+   listing succeeds" is not the discriminator I assumed. It was confidently
+   reporting `no_list_permission` for what was actually a prefix restriction.
+   It now reports the ambiguity honestly rather than picking one.
+
+The write probe is opt-in, writes one tiny object and deletes it; the buckets
+were confirmed empty afterwards.
