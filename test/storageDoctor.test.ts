@@ -113,3 +113,56 @@ test('every verdict has advice attached', async () => {
   });
   assert.ok(result.advice.length > 20, 'advice must actually say something');
 });
+
+// --- endpoint validation ----------------------------------------------------
+// Every expectation below was driven through the real AWS SDK first; the
+// comments record what it actually did, not what I assumed it would do.
+
+test('REGRESSION: a scheme-less endpoint is what throws "Invalid URL"', async () => {
+  const { validateEndpoint } = await import('../src/utils/storageDoctor.ts');
+  const problem = validateEndpoint('s3.us-east-005.backblazeb2.com');
+  assert.ok(problem, 'must be rejected');
+  assert.match(problem!, /not an absolute URL/);
+  assert.match(problem!, /https:\/\/s3\.us-east-005\.backblazeb2\.com/, 'must suggest the fix verbatim');
+});
+
+test('a TRAILING SLASH is fine — verified against the real SDK', async () => {
+  const { validateEndpoint } = await import('../src/utils/storageDoctor.ts');
+  assert.equal(validateEndpoint('https://s3.us-east-005.backblazeb2.com/'), null);
+  assert.equal(validateEndpoint('https://s3.us-east-005.backblazeb2.com'), null);
+});
+
+test('whitespace-only is rejected, and empty is called out separately', async () => {
+  const { validateEndpoint } = await import('../src/utils/storageDoctor.ts');
+  assert.match(validateEndpoint('   ')!, /empty or whitespace/);
+  assert.match(validateEndpoint('')!, /empty or whitespace/);
+});
+
+test('a surrounding newline or space does not trip the check', async () => {
+  // The SDK tolerates these, so neither should we — a false alarm here would
+  // send someone hunting a problem that is not there.
+  const { validateEndpoint } = await import('../src/utils/storageDoctor.ts');
+  assert.equal(validateEndpoint('https://example.com\n'), null);
+  assert.equal(validateEndpoint(' https://example.com'), null);
+});
+
+test('a non-http scheme is rejected with its own message', async () => {
+  const { validateEndpoint } = await import('../src/utils/storageDoctor.ts');
+  assert.match(validateEndpoint('ftp://example.com')!, /must be https/);
+});
+
+test('diagnose reports endpoint_malformed before touching the network', async () => {
+  const { diagnose } = await import('../src/utils/storageDoctor.ts');
+  const result = await diagnose({
+    provider: 'backblaze',
+    label: 'backblaze',
+    endpoint: 's3.us-east-005.backblazeb2.com',
+    region: 'us-east-005',
+    bucket: 'cold',
+    accessKeyId: 'a',
+    secretAccessKey: 'b',
+  });
+  assert.equal(result.verdict, 'endpoint_malformed');
+  assert.deepEqual(result.steps.map((s) => s.probe), ['credentials', 'endpoint']);
+  assert.match(result.advice, /WITHOUT the scheme/);
+});

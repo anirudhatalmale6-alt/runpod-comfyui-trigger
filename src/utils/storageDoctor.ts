@@ -49,6 +49,7 @@ export type Verdict =
   | 'no_list_permission_or_prefix_restricted'
   | 'prefix_restricted'
   | 'endpoint_unreachable'
+  | 'endpoint_malformed'
   | 'unknown';
 
 export type ProbeResult = {
@@ -151,6 +152,8 @@ const ADVICE: Record<Verdict, string> = {
   prefix_restricted:
     'The key is restricted to a name prefix, and the prefix being listed is outside it. Either list within the permitted prefix, or issue a key that covers the whole bucket.',
   endpoint_unreachable: 'The endpoint host did not resolve or refused the connection. Check the URL.',
+  endpoint_malformed:
+    'The endpoint is not a usable absolute URL, so the AWS SDK throws "TypeError: Invalid URL" on the first request — which surfaces as a migration failure rather than anything that mentions the endpoint. The usual cause is pasting the host from the provider console WITHOUT the scheme: it must be "https://s3.us-west-004.backblazeb2.com", not "s3.us-west-004.backblazeb2.com". Verified: a trailing slash is fine, a trailing newline is fine, but a missing scheme or a whitespace-only value both throw Invalid URL.',
   unknown: 'Unrecognised error — see the steps below for the raw code and message.',
 };
 
@@ -169,6 +172,16 @@ export async function diagnose(config: StorageProbeConfig): Promise<ProbeResult>
     return finish('credentials_missing');
   }
   steps.push({ probe: 'credentials', ok: true, message: `keyId length ${config.accessKeyId.length}` });
+
+  // Check the endpoint parses BEFORE any request. A bad endpoint otherwise
+  // surfaces as a bare "TypeError: Invalid URL" from deep inside the SDK, with
+  // nothing naming the endpoint as the cause.
+  const endpointProblem = validateEndpoint(config.endpoint);
+  if (endpointProblem) {
+    steps.push({ probe: 'endpoint', ok: false, message: endpointProblem });
+    return finish('endpoint_malformed');
+  }
+  steps.push({ probe: 'endpoint', ok: true, message: config.endpoint });
 
   const client = buildClient(config);
 
@@ -349,4 +362,39 @@ export function envNamesFor(provider: 'tigris' | 'backblaze', env: NodeJS.Proces
     else missing.push(names.join(" or "));
   }
   return { found, missing };
+}
+
+
+/**
+ * Is this endpoint something the AWS SDK can actually turn into a URL?
+ *
+ * Returns a human-readable problem, or null when it is fine. Behaviour below is
+ * not guesswork — each case was driven through the real SDK:
+ *
+ *   "https://host"      OK
+ *   "https://host/"     OK  (a trailing slash is harmless)
+ *   "https://host\n"    OK  (a trailing newline is tolerated)
+ *   " https://host"     OK  (a leading space is tolerated)
+ *   "host"              TypeError: Invalid URL   <- missing scheme
+ *   "   "               TypeError: Invalid URL
+ *   ""                  PermanentRedirect        <- different symptom
+ *   "htp://host"        EndpointError            <- different symptom
+ */
+export function validateEndpoint(endpoint: string): string | null {
+  if (endpoint.trim() === '') {
+    return 'the endpoint is empty or whitespace only';
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(endpoint.trim());
+  } catch {
+    return (
+      `"${endpoint.trim()}" is not an absolute URL. ` +
+      `It almost certainly needs the scheme: try "https://${endpoint.trim()}".`
+    );
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    return `"${endpoint.trim()}" uses the scheme "${parsed.protocol}" — it must be https:// (or http:// locally).`;
+  }
+  return null;
 }
