@@ -32,20 +32,47 @@ fi
 echo "Installing into: $TARGET"
 echo ""
 
-mkdir -p "$TARGET/src/utils" "$TARGET/src/trigger"
-
 copy() {
-  local from="$1" to="$2"
+  from="$1"
+  to="$2"
   if [ -f "$to" ]; then
-    cp "$to" "$to.bak-$(date +%s)"
-    echo "  backed up existing $(basename "$to") -> $(basename "$to").bak-*"
+    # Backups go OUTSIDE the target tree. A .bak file left next to a .ts inside
+    # a trigger dir would be harmless, but anything the CLI's glob can match
+    # (*.js, *.mjs, *.cjs) becomes a second entry point and breaks the build
+    # with "Two output files share the same path". Keeping backups out of the
+    # tree entirely removes the question.
+    mkdir -p "$BACKUP_DIR/$(dirname "${to#$TARGET/}")"
+    cp "$to" "$BACKUP_DIR/${to#$TARGET/}"
+    echo "  backed up existing ${to#$TARGET/} -> $BACKUP_DIR/${to#$TARGET/}"
   fi
   cp "$from" "$to"
-  echo "  installed $(basename "$to")"
+  echo "  installed ${to#$TARGET/}"
 }
 
-copy "$HERE/src/utils/runpodClient.ts"        "$TARGET/src/utils/runpodClient.ts"
-copy "$HERE/src/trigger/revenueGateRouter.ts" "$TARGET/src/trigger/revenueGateRouter.ts"
+# Walk src/ rather than listing files by hand.
+#
+# The hand-written list silently went stale once already: configDoctor.ts and
+# envReport.ts were added to this package after install.sh was written, so they
+# were never copied, and the config-doctor task simply did not exist in the
+# target repo even though it had been deployed. Enumerating the directory means
+# a new source file cannot be forgotten.
+BACKUP_DIR="$TARGET/.runpod-install-backup"
+INSTALLED=0
+
+for from in $(find "$HERE/src" -name '*.ts' -not -name '*.test.ts' | sort); do
+  rel=${from#$HERE/}
+  to="$TARGET/$rel"
+  mkdir -p "$(dirname "$to")"
+  copy "$from" "$to"
+  INSTALLED=$((INSTALLED + 1))
+done
+
+if [ "$INSTALLED" -eq 0 ]; then
+  echo "error: found no .ts files under $HERE/src — is this a complete clone?" >&2
+  exit 1
+fi
+echo ""
+echo "  $INSTALLED source file(s) installed"
 
 if [ ! -f "$TARGET/.env.example" ]; then
   cp "$HERE/.env.example" "$TARGET/.env.example"
