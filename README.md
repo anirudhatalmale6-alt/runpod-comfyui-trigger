@@ -1,5 +1,23 @@
 # revenueGateRouter → RunPod Serverless (ComfyUI)
 
+> ## ⚠️ Do not deploy a clone of this repository
+>
+> This is a **source package, not a deployable Trigger.dev project**. It has no
+> `trigger.config.ts` at its root, no `tsconfig.json`, and `@trigger.dev/sdk` is
+> not a dependency here. Running `npx trigger.dev deploy` inside a clone fails
+> with *"Couldn't find your trigger.config.ts file"* — the same error we spent
+> the last milestone diagnosing, for a completely unrelated reason.
+>
+> The two source files belong in **your** repo, next to your existing tasks:
+>
+> ```bash
+> git clone https://github.com/anirudhatalmale6-alt/runpod-comfyui-trigger
+> cd runpod-comfyui-trigger
+> bash install.sh /path/to/your/repo
+> ```
+>
+> Then deploy from **your** repo root, not from this one.
+
 Asynchronous submit-and-poll integration against the RunPod Serverless API v2,
 built to the spec in the brief. Written, compiled and tested; **not deployed** —
 see "What I cannot do" below before reading anything else here as finished.
