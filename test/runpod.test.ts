@@ -49,33 +49,77 @@ function virtualClock(slept: number[]): () => number {
 
 // --- submission -------------------------------------------------------------
 
-test('submitJob wraps the prompt in a root-level input object', async () => {
+test('submitJob adds the root-level input envelope and nothing else', async () => {
   await withMock({}, async (config, mock) => {
-    const result = await submitJob(config, { '3': { class_type: 'KSampler' } });
+    const result = await submitJob(config, { workflow: { '3': { class_type: 'KSampler' } } });
     assert.equal(result.id, 'job-1');
     assert.equal(result.status, 'IN_QUEUE');
-    assert.deepEqual(mock.submissions[0], { input: { '3': { class_type: 'KSampler' } } });
+    assert.deepEqual(mock.submissions[0], { input: { workflow: { '3': { class_type: 'KSampler' } } } });
   });
 });
 
-test('submitJob does NOT double-wrap an already-wrapped payload', async () => {
-  // Guards the one mistake that yields an empty prompt with a 200 OK.
+test('REGRESSION: the graph must sit under input.workflow, not bare under input', async () => {
+  // The live container rejects a bare graph with "Missing 'workflow' parameter".
+  // This is the exact wire format, asserted byte for byte.
   await withMock({}, async (config, mock) => {
-    await submitJob(config, { prompt: { '3': {} } });
-    assert.deepEqual(mock.submissions[0], { input: { prompt: { '3': {} } } });
+    const graph = { '3': { class_type: 'KSampler', inputs: { seed: 42 } } };
+    await submitJob(config, { workflow: graph });
+    assert.equal(
+      JSON.stringify(mock.submissions[0]),
+      JSON.stringify({ input: { workflow: graph } }),
+    );
+  });
+});
+
+test('REGRESSION: a bare graph under input is FAILED by the container, not rejected at submit', async () => {
+  // Models the live behaviour exactly: 200 OK on submit, then the job dies.
+  // This is what cost two real GPU submissions.
+  await withMock({}, async (config, mock) => {
+    const { waitSeconds, slept } = stubWait();
+    const submission = await submitJob(config, { '3': { class_type: 'KSampler' } });
+    assert.equal(submission.status, 'IN_QUEUE', 'submission is accepted despite being wrong');
+    const terminal = await pollUntilTerminal(config, submission.id, {
+      waitSeconds,
+      nowMs: virtualClock(slept),
+    });
+    assert.equal(terminal.status, 'FAILED');
+    assert.equal(terminal.error, "Missing 'workflow' parameter");
+  });
+});
+
+test('submitJob refuses an already-wrapped payload instead of double-wrapping', async () => {
+  // {input:{input:...}} would 200 and then fail on the GPU, which is expensive.
+  await withMock({}, async (config) => {
+    await assert.rejects(
+      () => submitJob(config, { input: { workflow: {} } }),
+      (err: unknown) => {
+        assert.ok(err instanceof RunPodPermanentError);
+        assert.match((err as Error).message, /double-wrapped/);
+        return true;
+      },
+    );
+  });
+});
+
+test('extra input fields sit alongside workflow inside input', async () => {
+  await withMock({}, async (config, mock) => {
+    await submitJob(config, { images: ['a.png'], s3: { bucket: 'hot' }, workflow: { '3': {} } });
+    assert.deepEqual(mock.submissions[0], {
+      input: { images: ['a.png'], s3: { bucket: 'hot' }, workflow: { '3': {} } },
+    });
   });
 });
 
 test('submitJob sends the API key as a Bearer token', async () => {
   await withMock({}, async (config, mock) => {
-    await submitJob(config, { a: 1 });
+    await submitJob(config, { workflow: { a: 1 } });
     assert.equal(mock.requests[0].auth, `Bearer ${API_KEY}`);
   });
 });
 
 test('submitJob hits POST /v2/{endpointId}/run', async () => {
   await withMock({}, async (config, mock) => {
-    await submitJob(config, { a: 1 });
+    await submitJob(config, { workflow: { a: 1 } });
     assert.equal(mock.requests[0].method, 'POST');
     assert.equal(mock.requests[0].path, `/v2/${ENDPOINT_ID}/run`);
   });
@@ -84,7 +128,7 @@ test('submitJob hits POST /v2/{endpointId}/run', async () => {
 test('a wrong API key is a PERMANENT error, not retried forever', async () => {
   await withMock({}, async (config) => {
     const bad = { ...config, apiKey: 'rp_wrong' };
-    await assert.rejects(() => submitJob(bad, { a: 1 }), (err: unknown) => {
+    await assert.rejects(() => submitJob(bad, { workflow: { a: 1 } }), (err: unknown) => {
       assert.ok(err instanceof RunPodPermanentError);
       assert.equal((err as RunPodPermanentError).status, 401);
       return true;
@@ -95,31 +139,31 @@ test('a wrong API key is a PERMANENT error, not retried forever', async () => {
 test('a wrong endpoint id is a PERMANENT error', async () => {
   await withMock({}, async (config) => {
     const bad = { ...config, endpointId: 'does-not-exist' };
-    await assert.rejects(() => submitJob(bad, { a: 1 }), RunPodPermanentError);
+    await assert.rejects(() => submitJob(bad, { workflow: { a: 1 } }), RunPodPermanentError);
   });
 });
 
 test('a 500 on submit is a TRANSIENT error', async () => {
   await withMock({ failSubmitTimes: 1, failSubmitStatus: 500 }, async (config) => {
-    await assert.rejects(() => submitJob(config, { a: 1 }), RunPodTransientError);
+    await assert.rejects(() => submitJob(config, { workflow: { a: 1 } }), RunPodTransientError);
   });
 });
 
 test('a 429 on submit is TRANSIENT', async () => {
   await withMock({ failSubmitTimes: 1, failSubmitStatus: 429 }, async (config) => {
-    await assert.rejects(() => submitJob(config, { a: 1 }), RunPodTransientError);
+    await assert.rejects(() => submitJob(config, { workflow: { a: 1 } }), RunPodTransientError);
   });
 });
 
 test('a 400 on submit is PERMANENT', async () => {
   await withMock({ failSubmitTimes: 1, failSubmitStatus: 400 }, async (config) => {
-    await assert.rejects(() => submitJob(config, { a: 1 }), RunPodPermanentError);
+    await assert.rejects(() => submitJob(config, { workflow: { a: 1 } }), RunPodPermanentError);
   });
 });
 
 test('a 200 with no job id is treated as permanent, not silently accepted', async () => {
   await withMock({ submitWithoutId: true }, async (config) => {
-    await assert.rejects(() => submitJob(config, { a: 1 }), (err: unknown) => {
+    await assert.rejects(() => submitJob(config, { workflow: { a: 1 } }), (err: unknown) => {
       assert.ok(err instanceof RunPodPermanentError);
       assert.match((err as Error).message, /returned no job id/);
       return true;
@@ -149,7 +193,7 @@ test('polls through IN_QUEUE and IN_PROGRESS to COMPLETED', async () => {
     async (config) => {
       const { waitSeconds, slept } = stubWait();
       const seen: string[] = [];
-      const result = await pollUntilTerminal(config, (await submitJob(config, { a: 1 })).id, {
+      const result = await pollUntilTerminal(config, (await submitJob(config, { workflow: { a: 1 } })).id, {
         waitSeconds,
         nowMs: virtualClock(slept),
         onPoll: (_a, status) => seen.push(status),
@@ -164,7 +208,7 @@ test('polls through IN_QUEUE and IN_PROGRESS to COMPLETED', async () => {
 test('the wait between polls backs off and never busy-loops', async () => {
   await withMock({ script: { queuePolls: 3, progressPolls: 3 } }, async (config) => {
     const { waitSeconds, slept } = stubWait();
-    await pollUntilTerminal(config, (await submitJob(config, { a: 1 })).id, {
+    await pollUntilTerminal(config, (await submitJob(config, { workflow: { a: 1 } })).id, {
       waitSeconds,
       nowMs: virtualClock(slept),
     });
@@ -177,7 +221,7 @@ test('the wait between polls backs off and never busy-loops', async () => {
 test('a FAILED job is returned as terminal, not thrown by the poller', async () => {
   await withMock({ script: { queuePolls: 0, progressPolls: 1, terminal: 'FAILED', error: 'OOM on the GPU' } }, async (config) => {
     const { waitSeconds, slept } = stubWait();
-    const result = await pollUntilTerminal(config, (await submitJob(config, { a: 1 })).id, {
+    const result = await pollUntilTerminal(config, (await submitJob(config, { workflow: { a: 1 } })).id, {
       waitSeconds,
       nowMs: virtualClock(slept),
     });
@@ -189,7 +233,7 @@ test('a FAILED job is returned as terminal, not thrown by the poller', async () 
 test('CANCELLED terminates the loop instead of polling forever', async () => {
   await withMock({ script: { queuePolls: 0, progressPolls: 0, terminal: 'CANCELLED' } }, async (config) => {
     const { waitSeconds, slept } = stubWait();
-    const result = await pollUntilTerminal(config, (await submitJob(config, { a: 1 })).id, {
+    const result = await pollUntilTerminal(config, (await submitJob(config, { workflow: { a: 1 } })).id, {
       waitSeconds,
       nowMs: virtualClock(slept),
     });
@@ -201,7 +245,7 @@ test('CANCELLED terminates the loop instead of polling forever', async () => {
 test('TIMED_OUT terminates the loop', async () => {
   await withMock({ script: { queuePolls: 0, progressPolls: 0, terminal: 'TIMED_OUT' } }, async (config) => {
     const { waitSeconds, slept } = stubWait();
-    const result = await pollUntilTerminal(config, (await submitJob(config, { a: 1 })).id, {
+    const result = await pollUntilTerminal(config, (await submitJob(config, { workflow: { a: 1 } })).id, {
       waitSeconds,
       nowMs: virtualClock(slept),
     });
@@ -213,7 +257,7 @@ test('the deadline is enforced and the job is cancelled on the way out', async (
   // A job that never leaves the queue.
   await withMock({ script: { queuePolls: 10_000, progressPolls: 0 } }, async (config, mock) => {
     const { waitSeconds, slept } = stubWait();
-    const jobId = (await submitJob(config, { a: 1 })).id;
+    const jobId = (await submitJob(config, { workflow: { a: 1 } })).id;
     await assert.rejects(
       () =>
         pollUntilTerminal(config, jobId, {
@@ -237,7 +281,7 @@ test('the deadline is enforced and the job is cancelled on the way out', async (
 test('cancelOnDeadline:false leaves the job running and says so', async () => {
   await withMock({ script: { queuePolls: 10_000 } }, async (config, mock) => {
     const { waitSeconds, slept } = stubWait();
-    const jobId = (await submitJob(config, { a: 1 })).id;
+    const jobId = (await submitJob(config, { workflow: { a: 1 } })).id;
     await assert.rejects(
       () =>
         pollUntilTerminal(config, jobId, {
@@ -258,7 +302,7 @@ test('cancelOnDeadline:false leaves the job running and says so', async () => {
 test('a failed cancel does not mask the deadline error', async () => {
   await withMock({ script: { queuePolls: 10_000 } }, async (config) => {
     const { waitSeconds, slept } = stubWait();
-    const jobId = (await submitJob(config, { a: 1 })).id;
+    const jobId = (await submitJob(config, { workflow: { a: 1 } })).id;
     // Point cancellation at a dead port so it throws internally.
     const broken = { ...config, baseUrl: 'http://127.0.0.1:1' };
     await assert.rejects(
@@ -276,7 +320,7 @@ test('a failed cancel does not mask the deadline error', async () => {
 test('custom intervals are honoured', async () => {
   await withMock({ script: { queuePolls: 2, progressPolls: 0 } }, async (config) => {
     const { waitSeconds, slept } = stubWait();
-    await pollUntilTerminal(config, (await submitJob(config, { a: 1 })).id, {
+    await pollUntilTerminal(config, (await submitJob(config, { workflow: { a: 1 } })).id, {
       waitSeconds,
       nowMs: virtualClock(slept),
       intervals: [1, 2, 3],
@@ -289,7 +333,7 @@ test('custom intervals are honoured', async () => {
 
 test('getJobStatus hits GET /v2/{endpointId}/status/{jobId}', async () => {
   await withMock({}, async (config, mock) => {
-    const id = (await submitJob(config, { a: 1 })).id;
+    const id = (await submitJob(config, { workflow: { a: 1 } })).id;
     await getJobStatus(config, id);
     const last = mock.requests[mock.requests.length - 1];
     assert.equal(last.method, 'GET');
@@ -299,14 +343,14 @@ test('getJobStatus hits GET /v2/{endpointId}/status/{jobId}', async () => {
 
 test('a non-JSON status body is transient, not a crash', async () => {
   await withMock({ malformedStatusOnce: true }, async (config) => {
-    const id = (await submitJob(config, { a: 1 })).id;
+    const id = (await submitJob(config, { workflow: { a: 1 } })).id;
     await assert.rejects(() => getJobStatus(config, id), RunPodTransientError);
   });
 });
 
 test('a 503 on status is transient', async () => {
   await withMock({ failStatusTimes: 1, failStatusStatus: 503 }, async (config) => {
-    const id = (await submitJob(config, { a: 1 })).id;
+    const id = (await submitJob(config, { workflow: { a: 1 } })).id;
     await assert.rejects(() => getJobStatus(config, id), RunPodTransientError);
   });
 });
@@ -326,7 +370,7 @@ test('cancelJob returns false rather than throwing when it cannot reach RunPod',
 
 test('a network failure is transient', async () => {
   const dead: RunPodConfig = { apiKey: API_KEY, endpointId: ENDPOINT_ID, baseUrl: 'http://127.0.0.1:1' };
-  await assert.rejects(() => submitJob(dead, { a: 1 }), RunPodTransientError);
+  await assert.rejects(() => submitJob(dead, { workflow: { a: 1 } }), RunPodTransientError);
 });
 
 test('a hung endpoint is abandoned at the request timeout', async () => {
@@ -343,7 +387,7 @@ test('a hung endpoint is abandoned at the request timeout', async () => {
     requestTimeoutMs: 250,
   };
   try {
-    await assert.rejects(() => submitJob(config, { a: 1 }), RunPodTransientError);
+    await assert.rejects(() => submitJob(config, { workflow: { a: 1 } }), RunPodTransientError);
   } finally {
     await new Promise<void>((r) => server.close(() => r()));
   }

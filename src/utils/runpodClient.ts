@@ -166,18 +166,36 @@ async function request(
 /**
  * Submit an asynchronous job.
  *
- * The payload is wrapped in a root-level `input` object, as required. Callers
- * pass the ComfyUI prompt graph and it is nested for them — passing an already
- * wrapped object would produce `{input:{input:{...}}}`, which the worker would
- * silently treat as an empty prompt, so this is the only place the wrapping
- * happens.
+ * `input` becomes the body's root-level `input` object verbatim:
+ *
+ *     submitJob(config, { workflow: graph })
+ *       -> POST body {"input":{"workflow":{...}}}
+ *
+ * This function adds the `input` envelope and NOTHING else. What goes inside it
+ * is the caller's business, because the required shape is a property of the
+ * worker image rather than of RunPod: the ComfyUI container in use here wants
+ * the graph under `input.workflow`, and rejects a bare graph with
+ * "Missing 'workflow' parameter".
+ *
+ * Do not pass an already-wrapped object — `{input: {...}}` would produce
+ * `{"input":{"input":{...}}}`, which the worker accepts as a 200 and then fails
+ * on, so it is the expensive kind of mistake.
  */
 export async function submitJob(
   config: RunPodConfig,
-  promptPayload: Record<string, unknown>,
+  input: Record<string, unknown>,
 ): Promise<SubmitResponse> {
+  if ('input' in input) {
+    throw new RunPodPermanentError(
+      `submitJob was given an object that already has an "input" key, which would be double-wrapped ` +
+        `into {"input":{"input":...}}. Pass the contents of input, e.g. { workflow: graph }.`,
+      0,
+      '',
+    );
+  }
+
   const raw = await request(config, 'POST', `/v2/${config.endpointId}/run`, {
-    input: promptPayload,
+    input,
   });
 
   const parsed = raw as { id?: unknown; status?: unknown; error?: unknown };

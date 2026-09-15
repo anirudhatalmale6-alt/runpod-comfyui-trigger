@@ -31,7 +31,7 @@ see "What I cannot do" below before reading anything else here as finished.
 | `src/trigger/revenueGateRouter.ts` | The task. Supplies `wait.for` to the poller and resolves terminal states. |
 | `src/trigger/configDoctor.ts` | Zero-cost diagnostic task. Reports what the runtime can see, no GPU job. |
 | `test/mockRunpod.ts` | A mock RunPod endpoint: enforces the Bearer token and the `input` wrapper, walks jobs IN_QUEUE → IN_PROGRESS → terminal, and can inject 401s / 500s / malformed bodies. |
-| `test/runpod.test.ts`, `test/envReport.test.ts` | 39 tests, all passing. |
+| `test/runpod.test.ts`, `test/envReport.test.ts` | 42 tests, all passing. |
 | `config/trigger.config.ts` | Updated config — see the `maxDuration` note. |
 | `config/package.scripts.json` | The `scripts` block to merge, because yours has none. |
 | `.env.example` | Placeholders only. |
@@ -39,7 +39,7 @@ see "What I cannot do" below before reading anything else here as finished.
 ## Verified
 
 ```
-npm test                            39 passed, 0 failed
+npm test                            42 passed, 0 failed
 tsc --noEmit                        clean, inside your real tsconfig
 esbuild (CLI's own build options)   BUILD OK, warnings: none
                                     src/utils/runpodClient.ts bundled via the
@@ -50,6 +50,56 @@ preflight.sh                        all checks pass
 The esbuild line matters: `runpodClient.ts` appears in the bundled inputs, which
 is the proof the `@/utils/runpodClient` alias resolved rather than being left as
 an unresolved external.
+
+## BREAKING: the task payload changed
+
+The live container wants the graph under `input.workflow`. A bare graph is
+accepted with a 200 and then dies with `Missing 'workflow' parameter`.
+
+```diff
+- await revenueGateRouter.trigger({ prompt: graph })
++ await revenueGateRouter.trigger({ workflow: graph })
+```
+
+Wire body, captured from a real `submitJob` call rather than asserted in a test:
+
+```
+POST https://api.runpod.ai/v2/<endpointId>/run
+Authorization: Bearer <RUNPOD_API_KEY>
+
+{"input":{"workflow":{"3":{"class_type":"KSampler","inputs":{"seed":42}}}}}
+```
+
+Anything else the worker image wants alongside the graph goes in `extraInput`
+and is merged into `input` beside `workflow`:
+
+```ts
+await revenueGateRouter.trigger({
+  workflow: graph,
+  extraInput: { images: [...] },   // -> {"input":{"images":[...],"workflow":{...}}}
+})
+```
+
+`workflow` is spread last, so `extraInput` can never clobber it, and passing a
+`workflow` key inside `extraInput` is rejected up front rather than silently
+picking one.
+
+## BREAKING: retries are off
+
+`maxAttempts` was 3. It is now **1**.
+
+A retry re-enters `run()` from the top, so it calls `submitJob` again and bills a
+**brand new RunPod job and cold start**. It does not resume the job already in
+flight. That is how one bad workflow turned into two real GPU submissions.
+
+A RunPod-reported `FAILED` now raises `AbortTaskRunError`, so Trigger.dev stops
+instead of resubmitting. Set `retryOnRunPodFailure: true` in the payload if your
+failures are genuinely transient (worker OOM), but understand that each retry is
+a fresh billable job.
+
+If you want real retry safety, the correct shape is to split submission and
+polling into two tasks so a polling failure retries without re-submitting. That
+is maybe an hour's work — say the word.
 
 ## Against your spec
 
@@ -145,14 +195,18 @@ Stated plainly, because your escrow gate depends on it.
 
 So everything in Phase 3 and the acceptance screenshot are yours to run. What I
 can do is make sure that when you run them, they work — which is what the mock
-server and the 39 tests are for. If any of them fails, paste the output and I
+server and the 42 tests are for. If any of them fails, paste the output and I
 will fix it.
 
 ## What is not tested
 
-- **Never called against the real RunPod API.** Every test runs against
-  `test/mockRunpod.ts`. The mock implements the documented contract, so if RunPod
-  deviates from its own docs the tests will not catch it.
+- ~~Never called against the real RunPod API.~~ It has now been, and the mock
+  was **wrong**: it accepted a bare graph under `input` that the live ComfyUI
+  container rejects. That gap is closed — the mock now requires `input.workflow`
+  and fails the job with the container's own message when it is missing, so the
+  suite reproduces the failure rather than passing through it. The lesson stands
+  though: a mock encodes what I believed the contract was, and belief is not
+  evidence.
 - **No real ComfyUI prompt graph has been through this.** The prompt is passed
   through opaquely by design, but that means a malformed graph fails at the
   worker, not here.

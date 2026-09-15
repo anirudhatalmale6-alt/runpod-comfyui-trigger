@@ -25,12 +25,29 @@ import {
 
 export type RevenueGatePayload = {
   /**
-   * The ComfyUI prompt graph. Passed through untouched and wrapped in the
-   * root-level `input` object by the client — do NOT wrap it here as well.
+   * The ComfyUI workflow graph.
+   *
+   * Sent as `input.workflow` — the live container rejects a bare graph with
+   * "Missing 'workflow' parameter". Pass the graph itself here, NOT an object
+   * that already has a `workflow` or `input` key.
    */
-  prompt: Record<string, unknown>;
+  workflow: Record<string, unknown>;
+  /**
+   * Anything else the worker image expects alongside the graph (images, S3
+   * settings, and so on). Merged into `input` next to `workflow`.
+   */
+  extraInput?: Record<string, unknown>;
   /** Optional per-run override of the polling deadline. */
   deadlineSeconds?: number;
+  /**
+   * Retry the whole task when RunPod reports the job FAILED. Default false.
+   *
+   * Off by default because a retry re-submits a NEW RunPod job and bills a new
+   * cold start, and the overwhelmingly common cause of a FAILED job is a
+   * malformed workflow, which will fail identically every time. Turn it on only
+   * if your failures are genuinely transient (worker OOM, for instance).
+   */
+  retryOnRunPodFailure?: boolean;
 };
 
 export type RevenueGateResult = {
@@ -88,25 +105,44 @@ function loadConfig(environmentLabel: string): RunPodConfig {
 
 export const revenueGateRouter = task({
   id: 'revenue-gate-router',
-  // Cap the retries: a ComfyUI render is expensive, and re-running the whole
-  // task re-submits a brand new RunPod job rather than resuming the old one.
+  // ONE attempt, deliberately.
+  //
+  // There is no way to retry this task cheaply: a retry re-enters run() from the
+  // top, so it calls submitJob again and bills a brand new RunPod job and cold
+  // start. It does NOT resume the job already in flight. With maxAttempts: 3 a
+  // single bad workflow quietly cost three GPU submissions.
+  //
+  // If you want retries, the right shape is to split submission and polling into
+  // two tasks so a polling failure can be retried without re-submitting. Ask and
+  // I will do it.
   retry: {
-    maxAttempts: 3,
-    minTimeoutInMs: 2_000,
-    maxTimeoutInMs: 30_000,
-    factor: 2,
+    maxAttempts: 1,
   },
   run: async (payload: RevenueGatePayload, { ctx }): Promise<RevenueGateResult> => {
     const config = loadConfig(ctx.environment.type);
 
-    if (!payload?.prompt || typeof payload.prompt !== 'object') {
+    if (!payload?.workflow || typeof payload.workflow !== 'object' || Array.isArray(payload.workflow)) {
       throw new AbortTaskRunError(
-        'payload.prompt is required and must be the ComfyUI prompt graph object',
+        'payload.workflow is required and must be the ComfyUI workflow graph object. ' +
+          'It is sent as input.workflow; the container rejects a bare graph with ' +
+          '"Missing \'workflow\' parameter".',
+      );
+    }
+
+    if (payload.extraInput && 'workflow' in payload.extraInput) {
+      throw new AbortTaskRunError(
+        'payload.extraInput must not contain a "workflow" key — pass the graph as payload.workflow. ' +
+          'Having it in both places is ambiguous and the wrong one would silently win.',
       );
     }
 
     // --- 1. submit -------------------------------------------------------
-    const submission = await submitJob(config, payload.prompt);
+    // Body becomes {"input": {...extraInput, "workflow": {...}}}.
+    // workflow is spread LAST so extraInput can never clobber it.
+    const submission = await submitJob(config, {
+      ...(payload.extraInput ?? {}),
+      workflow: payload.workflow,
+    });
     logger.info('RunPod job submitted', {
       jobId: submission.id,
       initialStatus: submission.status,
@@ -160,7 +196,12 @@ export const revenueGateRouter = task({
       // error text attached rather than swallowed.
       const detail =
         terminal.error === undefined ? '(no error detail returned)' : JSON.stringify(terminal.error);
-      throw new Error(`RunPod job ${terminal.id} ended as ${terminal.status}: ${detail}`);
+      const message = `RunPod job ${terminal.id} ended as ${terminal.status}: ${detail}`;
+
+      // AbortTaskRunError by default, so Trigger.dev does NOT retry. A retry
+      // would submit a fresh RunPod job and bill another cold start, and a
+      // workflow the worker rejects will be rejected identically every time.
+      throw payload.retryOnRunPodFailure ? new Error(message) : new AbortTaskRunError(message);
     }
 
     if (terminal.output === undefined || terminal.output === null) {

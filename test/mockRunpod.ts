@@ -34,6 +34,15 @@ export type MockOptions = {
   malformedStatusOnce?: boolean;
   /** Omit the id from the /run response. */
   submitWithoutId?: boolean;
+  /**
+   * Mirror the live ComfyUI container: require the graph under input.workflow
+   * and FAIL the job with "Missing 'workflow' parameter" when it is absent.
+   *
+   * Default true. The live endpoint accepts the submission with a 200 and only
+   * reports the problem later as a FAILED job, so this is modelled the same way
+   * — an accepted submission that dies during execution, not a 400.
+   */
+  requireWorkflow?: boolean;
 };
 
 export type MockHandle = {
@@ -61,6 +70,7 @@ export async function startMockRunPod(options: MockOptions): Promise<MockHandle>
   const cancels: string[] = [];
   const pollCounts = new Map<string, number>();
   const cancelled = new Set<string>();
+  const missingWorkflow = new Set<string>();
 
   let submitFailuresLeft = options.failSubmitTimes ?? 0;
   let statusFailuresLeft = options.failStatusTimes ?? 0;
@@ -127,6 +137,14 @@ export async function startMockRunPod(options: MockOptions): Promise<MockHandle>
         jobSeq += 1;
         const id = `job-${jobSeq}`;
         pollCounts.set(id, 0);
+
+        // The live container does not reject a missing workflow at submission
+        // time — it 200s, then the job dies. Model that exactly.
+        const inputObj = asObj.input as Record<string, unknown>;
+        if ((options.requireWorkflow ?? true) && !inputObj.workflow) {
+          missingWorkflow.add(id);
+        }
+
         send(200, { id, status: 'IN_QUEUE' });
         return;
       }
@@ -152,6 +170,10 @@ export async function startMockRunPod(options: MockOptions): Promise<MockHandle>
         }
         if (cancelled.has(jobId)) {
           send(200, { id: jobId, status: 'CANCELLED' });
+          return;
+        }
+        if (missingWorkflow.has(jobId)) {
+          send(200, { id: jobId, status: 'FAILED', error: "Missing 'workflow' parameter" });
           return;
         }
 
