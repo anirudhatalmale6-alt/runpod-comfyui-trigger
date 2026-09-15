@@ -175,10 +175,23 @@ export async function diagnose(config: StorageProbeConfig): Promise<ProbeResult>
   // Probe 1: list with the prefix the real job uses. This is the operation that
   // is actually failing, so try it first and take a success as the answer.
   try {
-    await client.send(
-      new ListObjectsV2Command({ Bucket: config.bucket, Prefix: config.prefix, MaxKeys: 1 }),
+    const listed = await client.send(
+      new ListObjectsV2Command({ Bucket: config.bucket, Prefix: config.prefix, MaxKeys: 1000 }),
     );
-    steps.push({ probe: 'listObjects', ok: true });
+    // Report HOW MANY keys are visible, not just that the call succeeded.
+    // A sweep that reports scanned:0 is indistinguishable from a broken one
+    // unless you can see whether the bucket is actually empty.
+    const count = listed.KeyCount ?? listed.Contents?.length ?? 0;
+    const sample = (listed.Contents ?? []).slice(0, 3).map((c) => c.Key).filter(Boolean);
+    steps.push({
+      probe: 'listObjects',
+      ok: true,
+      message:
+        count === 0
+          ? 'listing works, but the bucket is EMPTY at this prefix — nothing here to sweep'
+          : `${count}${listed.IsTruncated ? '+' : ''} object(s) visible` +
+            (sample.length > 0 ? `, e.g. ${sample.join(', ')}` : ''),
+    });
     return finish('ok');
   } catch (err) {
     const { code, status, message } = errCode(err);
