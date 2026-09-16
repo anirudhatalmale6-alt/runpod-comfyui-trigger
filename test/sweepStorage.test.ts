@@ -170,7 +170,7 @@ test('DRY RUN copies to cold, verifies size, and leaves hot INTACT', async (t) =
   await put(HOT, 'a.txt', 'alpha');
   await put(HOT, 'b.txt', 'bravo');
 
-  const result = await sweepStorage(deps(), { dryRun: true });
+  const result = await sweepStorage(deps(), { dryRun: true, minAgeDays: 0 });
 
   assert.equal(result.dryRun, true);
   assert.equal(result.scanned, 2);
@@ -192,7 +192,7 @@ test('a LIVE run copies and then deletes from hot', async (t) => {
   await emptyBucket(cold, COLD);
   await put(HOT, 'c.txt', 'charlie');
 
-  const result = await sweepStorage(deps(), { dryRun: false });
+  const result = await sweepStorage(deps(), { dryRun: false, minAgeDays: 0 });
 
   assert.equal(result.dryRun, false);
   assert.equal(result.migrated, 1);
@@ -207,7 +207,7 @@ test('dryRun defaults to FALSE for direct callers, preserving the original behav
   await emptyBucket(cold, COLD);
   await put(HOT, 'd.txt', 'delta');
 
-  const result = await sweepStorage(deps());
+  const result = await sweepStorage(deps(), { minAgeDays: 0 });
 
   assert.equal(result.dryRun, false);
   assert.equal(result.deleted, 1);
@@ -220,7 +220,7 @@ test('the old positional concurrency argument still works', async (t) => {
   await emptyBucket(cold, COLD);
   await put(HOT, 'e.txt', 'echo');
 
-  const result = await sweepStorage(deps(), 2);
+  const result = await sweepStorage(deps(), { concurrency: 2, minAgeDays: 0 });
   assert.equal(result.migrated, 1);
 });
 
@@ -230,7 +230,7 @@ test('a cold-side failure does NOT delete the source', async (t) => {
   await put(HOT, 'f.txt', 'foxtrot');
 
   const broken = { ...deps(), coldBucket: 'bucket-that-does-not-exist' };
-  const result = await sweepStorage(broken, { dryRun: false });
+  const result = await sweepStorage(broken, { dryRun: false, minAgeDays: 0 });
 
   assert.equal(result.migrated, 0);
   assert.equal(result.deleted, 0);
@@ -244,7 +244,7 @@ test('maxObjects bounds a first dry run over a large bucket', async (t) => {
   await emptyBucket(cold, COLD);
   for (const k of ['g1.txt', 'g2.txt', 'g3.txt', 'g4.txt', 'g5.txt']) await put(HOT, k, 'golf');
 
-  const result = await sweepStorage(deps(), { dryRun: true, maxObjects: 2 });
+  const result = await sweepStorage(deps(), { dryRun: true, maxObjects: 2, minAgeDays: 0 });
 
   assert.equal(result.scanned, 2, 'only two keys were considered');
   assert.equal(result.deleted, 0);
@@ -270,10 +270,120 @@ test('an empty hot bucket is a clean no-op', async (t) => {
   if (!requireS3(t)) return;
   await emptyBucket(hot, HOT);
   const result = await sweepStorage(deps(), { dryRun: true });
-  assert.deepEqual(result, { scanned: 0, migrated: 0, deleted: 0, dryRun: true, failed: [] });
+  assert.deepEqual(result, {
+    scanned: 0, skippedTooNew: 0, migrated: 0, deleted: 0,
+    dryRun: true, minAgeDays: 7, failed: [],
+  });
+});
+
+// --- the 7-day age filter ---------------------------------------------------
+
+const DAY = 24 * 60 * 60 * 1000;
+
+test('AGE FILTER: a fresh object is NOT swept', async (t) => {
+  if (!requireS3(t)) return;
+  await emptyBucket(hot, HOT);
+  await emptyBucket(cold, COLD);
+  await put(HOT, 'fresh.txt', 'brand new');
+
+  // Real clock: the object was created moments ago, so it is younger than 7 days.
+  const result = await sweepStorage(deps(), { dryRun: true, minAgeDays: 7 });
+
+  assert.equal(result.scanned, 1);
+  assert.equal(result.skippedTooNew, 1, 'held back by the filter');
+  assert.equal(result.migrated, 0);
+  assert.equal(result.minAgeDays, 7);
+  assert.deepEqual(await keysIn(hot, HOT), ['fresh.txt'], 'still in hot');
+  assert.deepEqual(await keysIn(cold, COLD), [], 'never copied to cold');
+});
+
+test('AGE FILTER: an object older than the threshold IS swept', async (t) => {
+  if (!requireS3(t)) return;
+  await emptyBucket(hot, HOT);
+  await emptyBucket(cold, COLD);
+  await put(HOT, 'old.txt', 'aged');
+
+  // Move the clock forward 30 days rather than fake the object's timestamp, so
+  // the real LastModified from the server is what gets compared.
+  const result = await sweepStorage(deps(), {
+    dryRun: true,
+    minAgeDays: 7,
+    nowMs: () => Date.now() + 30 * DAY,
+  });
+
+  assert.equal(result.scanned, 1);
+  assert.equal(result.skippedTooNew, 0);
+  assert.equal(result.migrated, 1);
+  assert.deepEqual(await keysIn(cold, COLD), ['old.txt'], 'copied to cold');
+  assert.deepEqual(await keysIn(hot, HOT), ['old.txt'], 'dry run left hot alone');
+});
+
+test('AGE FILTER: mixed ages — only the old ones go', async (t) => {
+  if (!requireS3(t)) return;
+  await emptyBucket(hot, HOT);
+  await emptyBucket(cold, COLD);
+  await put(HOT, 'a.txt', 'one');
+  await put(HOT, 'b.txt', 'two');
+
+  // 10 days on: both are older than 7. Then 3 days on: neither is.
+  const swept = await sweepStorage(deps(), { dryRun: true, minAgeDays: 7, nowMs: () => Date.now() + 10 * DAY });
+  assert.equal(swept.migrated, 2);
+
+  await emptyBucket(cold, COLD);
+  const held = await sweepStorage(deps(), { dryRun: true, minAgeDays: 7, nowMs: () => Date.now() + 3 * DAY });
+  assert.equal(held.migrated, 0);
+  assert.equal(held.skippedTooNew, 2);
+  assert.deepEqual(await keysIn(cold, COLD), [], 'nothing copied when all are too new');
+});
+
+test('AGE FILTER: minAgeDays 0 sweeps everything, preserving the old behaviour', async (t) => {
+  if (!requireS3(t)) return;
+  await emptyBucket(hot, HOT);
+  await emptyBucket(cold, COLD);
+  await put(HOT, 'now.txt', 'immediate');
+
+  const result = await sweepStorage(deps(), { dryRun: true, minAgeDays: 0 });
+  assert.equal(result.skippedTooNew, 0);
+  assert.equal(result.migrated, 1);
+});
+
+test('AGE FILTER: the default is 7 days, not 0', async (t) => {
+  if (!requireS3(t)) return;
+  await emptyBucket(hot, HOT);
+  await emptyBucket(cold, COLD);
+  await put(HOT, 'default.txt', 'x');
+
+  // No minAgeDays passed at all. A fresh object must be held back.
+  const result = await sweepStorage(deps(), { dryRun: true });
+  assert.equal(result.minAgeDays, 7, 'default must be 7');
+  assert.equal(result.migrated, 0);
+  assert.deepEqual(await keysIn(hot, HOT), ['default.txt']);
+});
+
+test('AGE FILTER: a LIVE run still respects it — fresh files are not deleted', async (t) => {
+  if (!requireS3(t)) return;
+  await emptyBucket(hot, HOT);
+  await emptyBucket(cold, COLD);
+  await put(HOT, 'keepme.txt', 'fresh and must survive');
+
+  const result = await sweepStorage(deps(), { dryRun: false, minAgeDays: 7 });
+
+  assert.equal(result.deleted, 0);
+  assert.deepEqual(await keysIn(hot, HOT), ['keepme.txt'], 'a live run must not delete a fresh file');
+});
+
+test('AGE FILTER: env parsing defaults to 7 and refuses to fail open', async () => {
+  const { sweepMinAgeDaysFromEnv } = await import(join(tempDir!, 'storageSweeper.ts'));
+  assert.equal(sweepMinAgeDaysFromEnv({}), 7, 'unset -> 7');
+  assert.equal(sweepMinAgeDaysFromEnv({ STORAGE_SWEEP_MIN_AGE_DAYS: '' }), 7);
+  assert.equal(sweepMinAgeDaysFromEnv({ STORAGE_SWEEP_MIN_AGE_DAYS: 'banana' }), 7, 'a typo must not mean 0');
+  assert.equal(sweepMinAgeDaysFromEnv({ STORAGE_SWEEP_MIN_AGE_DAYS: '-3' }), 7, 'negative must not mean 0');
+  assert.equal(sweepMinAgeDaysFromEnv({ STORAGE_SWEEP_MIN_AGE_DAYS: '14' }), 14);
+  assert.equal(sweepMinAgeDaysFromEnv({ STORAGE_SWEEP_MIN_AGE_DAYS: '0' }), 0, 'explicit 0 is honoured');
 });
 
 test('invalid options are rejected before anything is listed', async () => {
   await assert.rejects(() => sweepStorage(deps(), { concurrency: 0 }), /positive integer/);
   await assert.rejects(() => sweepStorage(deps(), { maxObjects: 0 }), /positive integer/);
+  await assert.rejects(() => sweepStorage(deps(), { minAgeDays: -1 }), /zero or a positive number/);
 });

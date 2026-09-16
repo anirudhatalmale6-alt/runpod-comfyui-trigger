@@ -40,13 +40,18 @@ import { backblazeClient, tigrisClient, uploadStream } from "../utils/storageCli
 import { requireEnv } from "../utils/env.js";
 
 export interface SweepResult {
+  /** Every object seen in the hot bucket listing. */
   scanned: number;
+  /** Held back by the age filter — younger than minAgeDays. */
+  skippedTooNew: number;
   /** Objects successfully copied to cold and size-verified. */
   migrated: number;
   /** Objects actually removed from hot. Always 0 in a dry run. */
   deleted: number;
   /** True when deletes were skipped. */
   dryRun: boolean;
+  /** The age threshold this run used, in days. */
+  minAgeDays: number;
   failed: Array<{ key: string; error: string }>;
 }
 
@@ -61,6 +66,16 @@ export interface StorageMigrationDependencies {
 export interface SweepOptions {
   /** Skip the delete from hot. Default false. */
   dryRun?: boolean;
+  /**
+   * Only sweep objects whose LastModified is at least this many days old.
+   * Default 7. Set 0 to sweep everything regardless of age.
+   *
+   * Without this the Sunday run moves renders written minutes earlier, and
+   * anything serving images straight from Tigris stops finding them.
+   */
+  minAgeDays?: number;
+  /** Injectable clock, milliseconds. Tests pass a fixed value. */
+  nowMs?: () => number;
   concurrency?: number;
   /**
    * Stop after this many keys. Unlimited by default. Useful for a first dry run
@@ -134,6 +149,8 @@ export async function sweepStorage(
   const concurrency = opts.concurrency ?? 3;
   const dryRun = opts.dryRun ?? false;
   const maxObjects = opts.maxObjects;
+  const minAgeDays = opts.minAgeDays ?? 7;
+  const now = opts.nowMs ?? Date.now;
 
   if (!Number.isSafeInteger(concurrency) || concurrency < 1) {
     throw new Error("Sweep concurrency must be a positive integer");
@@ -141,8 +158,15 @@ export async function sweepStorage(
   if (maxObjects !== undefined && (!Number.isSafeInteger(maxObjects) || maxObjects < 1)) {
     throw new Error("maxObjects must be a positive integer when provided");
   }
+  if (!Number.isFinite(minAgeDays) || minAgeDays < 0) {
+    throw new Error("minAgeDays must be zero or a positive number");
+  }
+
+  const cutoffMs = now() - minAgeDays * 24 * 60 * 60 * 1000;
 
   const keys: string[] = [];
+  let scanned = 0;
+  let skippedTooNew = 0;
   let continuationToken: string | undefined;
   do {
     const page = await dependencies.hotClient.send(
@@ -152,7 +176,19 @@ export async function sweepStorage(
       }),
     );
     for (const item of page.Contents ?? []) {
-      if (item.Key) keys.push(item.Key);
+      if (!item.Key) continue;
+      scanned += 1;
+
+      // Fail SAFE on an unknown age. An object whose LastModified we cannot
+      // read is left alone rather than swept — this deletes from hot, so
+      // "don't know" must mean "don't touch".
+      const modified = item.LastModified ? item.LastModified.getTime() : undefined;
+      if (modified === undefined || modified > cutoffMs) {
+        skippedTooNew += 1;
+        continue;
+      }
+
+      keys.push(item.Key);
       if (maxObjects !== undefined && keys.length >= maxObjects) break;
     }
     if (maxObjects !== undefined && keys.length >= maxObjects) break;
@@ -175,7 +211,7 @@ export async function sweepStorage(
     }
   });
 
-  return { scanned: keys.length, migrated, deleted, dryRun, failed };
+  return { scanned, skippedTooNew, migrated, deleted, dryRun, minAgeDays, failed };
 }
 
 async function mapWithConcurrency<T>(
@@ -201,6 +237,19 @@ async function mapWithConcurrency<T>(
  */
 export function sweepDryRunFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
   return (env.STORAGE_SWEEP_DRY_RUN ?? "").trim().toLowerCase() !== "false";
+}
+
+/**
+ * Age threshold in days, from STORAGE_SWEEP_MIN_AGE_DAYS. Defaults to 7.
+ * An unparseable or negative value falls back to 7 rather than to 0 — a typo
+ * must never silently turn into "sweep everything immediately".
+ */
+export function sweepMinAgeDaysFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = (env.STORAGE_SWEEP_MIN_AGE_DAYS ?? "").trim();
+  if (raw === "") return 7;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return 7;
+  return parsed;
 }
 
 /**
@@ -278,12 +327,13 @@ function logResolvedConfig(): void {
       secretAccessKey: secret("BACKBLAZE_AWS_SECRET_ACCESS_KEY", "BACKBLAZE_SECRET_ACCESS_KEY"),
     },
     dryRun: sweepDryRunFromEnv(),
+    minAgeDays: sweepMinAgeDaysFromEnv(),
     patchVersion: PATCH_VERSION,
   });
 }
 
 /** Bumped whenever this file changes, so a trace proves which version ran. */
-export const PATCH_VERSION = "sweeper-patch-4 (flags a master B2 key)";
+export const PATCH_VERSION = "sweeper-patch-5 (7-day age filter)";
 
 export const weeklyStorageSweeper = schedules.task({
   id: "weekly-storage-sweeper",
@@ -298,6 +348,7 @@ export const weeklyStorageSweeper = schedules.task({
     logResolvedConfig();
 
     const dryRun = sweepDryRunFromEnv();
+    const minAgeDays = sweepMinAgeDaysFromEnv();
 
     const result = await sweepStorage(
       {
@@ -307,7 +358,7 @@ export const weeklyStorageSweeper = schedules.task({
         coldBucket: requireEnv("BACKBLAZE_BUCKET_NAME"),
         upload: uploadStream,
       },
-      { dryRun },
+      { dryRun, minAgeDays },
     );
 
     // Passed as an explicit object literal, not `result` itself: logger's
@@ -316,9 +367,11 @@ export const weeklyStorageSweeper = schedules.task({
     // directly is a TS2345 compile error.
     const summary = {
       scanned: result.scanned,
+      skippedTooNew: result.skippedTooNew,
       migrated: result.migrated,
       deleted: result.deleted,
       dryRun: result.dryRun,
+      minAgeDays: result.minAgeDays,
       failedCount: result.failed.length,
     };
 
@@ -348,9 +401,20 @@ export const weeklyStorageSweeper = schedules.task({
         `Nothing to sweep: the hot bucket "${describeBucket()}" is empty, or ` +
           `TIGRIS_BUCKET_NAME points at a different bucket from the one holding your renders.`,
       );
-    } else if (result.migrated === result.scanned) {
+    } else if (result.skippedTooNew === result.scanned) {
+      // Distinguish "nothing eligible yet" from "nothing worked". Without this
+      // a healthy run over fresh renders reads identically to a broken one.
       logger.info(
-        `PASS — all ${result.scanned} object(s) copied to cold and size-verified.` +
+        `Nothing eligible: all ${result.scanned} object(s) in "${describeBucket()}" are ` +
+          `younger than ${result.minAgeDays} day(s), so none were swept. This is the age ` +
+          `filter working, not a failure.`,
+      );
+    } else {
+      const eligible = result.scanned - result.skippedTooNew;
+      logger.info(
+        `PASS — ${result.migrated} of ${eligible} eligible object(s) copied to cold and ` +
+          `size-verified (${result.skippedTooNew} held back as younger than ` +
+          `${result.minAgeDays} day(s)).` +
           (result.dryRun
             ? ` Still in dry run, so nothing was deleted. Set STORAGE_SWEEP_DRY_RUN=false to finish.`
             : ` ${result.deleted} removed from hot.`),
