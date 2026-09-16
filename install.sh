@@ -161,11 +161,28 @@ echo "       cp patches/storageSweeper.ts \"$TARGET/src/trigger/storageSweeper.t
 echo "     The scheduled task defaults to DRY RUN. Set STORAGE_SWEEP_DRY_RUN=false"
 echo "     once you have seen a clean dry run."
 echo ""
-echo "  4. Set RUNPOD_API_KEY and RUNPOD_ENDPOINT_ID in Trigger.dev under"
-echo "     Project Settings > Environment Variables for the target environment."
-echo "     Not in any file in the repo."
+echo "  4. Environment variables, set in Trigger.dev under Project Settings >"
+echo "     Environment Variables, for the target environment. Never in a file"
+echo "     in the repo. Note they are PER ENVIRONMENT: set in Development is"
+echo "     NOT set in Production."
+echo "       RunPod      RUNPOD_API_KEY, RUNPOD_ENDPOINT_ID"
+echo "       Bluesky     BLUESKY_HANDLE, BLUESKY_APP_PASSWORD"
+echo "       Telegram    TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_CHAT_ID"
 echo ""
-echo "Then, from YOUR repo root:"
-echo "  npm run build"
-echo "  npx trigger.dev@3.3.17 deploy --config=\"./trigger.config.ts\" --skip-update-check"
+
+# Pin the CLI to the major of the SDK actually installed in the TARGET.
+#
+# This line used to hard-code 3.3.17. A mismatched CLI major is what broke the
+# very first deploy on this project, so printing a fixed version here was a
+# trap waiting for the v4 upgrade in September.
+TARGET_SDK=$(node -p "require('$TARGET/node_modules/@trigger.dev/sdk/package.json').version" 2>/dev/null || true)
+if [ -n "$TARGET_SDK" ]; then
+  CLI_MAJOR=${TARGET_SDK%%.*}
+  echo "Then, from YOUR repo root (SDK $TARGET_SDK is installed, so use the matching CLI):"
+  echo "  npx trigger.dev@$CLI_MAJOR deploy --config=\"./trigger.config.ts\" --skip-update-check"
+else
+  echo "Then, from YOUR repo root — run npm install first, then check which major"
+  echo "@trigger.dev/sdk is on and use the MATCHING CLI major:"
+  echo "  npx trigger.dev@<same major as your SDK> deploy --config=\"./trigger.config.ts\" --skip-update-check"
+fi
 echo ""
