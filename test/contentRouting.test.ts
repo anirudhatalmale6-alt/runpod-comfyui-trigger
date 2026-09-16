@@ -120,7 +120,7 @@ test('the platform table itself: no mainstream lane may ever accept explicit', (
 test('SOCIAL_PLATFORMS is the six mainstream lanes, and Fanvue is not one', () => {
   assert.deepEqual(
     [...SOCIAL_PLATFORMS].sort(),
-    ['bluesky', 'facebook', 'instagram', 'tiktok', 'x', 'youtube'],
+    ['bluesky', 'facebook', 'instagram', 'telegram', 'tiktok', 'youtube'],
   );
   assert.ok(!SOCIAL_PLATFORMS.includes('fanvue'));
   assert.equal(SOCIAL_PLATFORMS.length, 6);
@@ -259,9 +259,9 @@ test('the agreed cadence sits below every ceiling in the table', () => {
 test('the idempotency key is per asset AND per destination', () => {
   const asset = { key: 'safe/a.png', kind: 'image' as MediaKind };
   const bsky = publishIdempotencyKey(asset, 'bluesky');
-  const x = publishIdempotencyKey(asset, 'x');
+  const tg = publishIdempotencyKey(asset, 'telegram');
 
-  assert.notEqual(bsky, x, 'one asset fanning out must not share a key across platforms');
+  assert.notEqual(bsky, tg, 'one asset fanning out must not share a key across platforms');
   // Otherwise a retry after "succeeded on Bluesky, failed on X" either
   // double-posts to Bluesky or never retries X, with no way to have neither.
   assert.equal(bsky, publishIdempotencyKey({ ...asset }, 'bluesky'), 'stable across calls');

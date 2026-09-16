@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test --experimental-strip-types test/runpod.test.ts test/envReport.test.ts test/workflowValidator.test.ts test/storageDoctor.test.ts test/sweepStorage.test.ts test/contentDelivery.test.ts test/contentRouting.test.ts test/blueskyClient.test.ts"
+    "test": "node --test --experimental-strip-types test/runpod.test.ts test/envReport.test.ts test/workflowValidator.test.ts test/storageDoctor.test.ts test/sweepStorage.test.ts test/contentDelivery.test.ts test/contentRouting.test.ts test/blueskyClient.test.ts test/publishScheduler.test.ts"
   },
   "peerDependencies": {
     "@aws-sdk/client-s3": ">=3.0.0"

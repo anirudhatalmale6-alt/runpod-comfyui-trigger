@@ -3,7 +3,7 @@
  *
  * This is the safety rail for the whole publishing pipeline, and it is the one
  * part of the system where a mistake cannot be undone. Explicit material
- * reaching Instagram, TikTok, YouTube, Facebook or X does not get fixed by
+ * reaching Instagram, TikTok, YouTube, Facebook or Telegram does not get fixed by
  * deleting the post: the account is gone, and the audience with it. Every other
  * failure in this project is recoverable. This one is not.
  *
@@ -40,7 +40,7 @@ export type PlatformId =
   | "bluesky"
   | "instagram"
   | "facebook"
-  | "x"
+  | "telegram"
   | "tiktok"
   | "youtube"
   | "fanvue";
@@ -110,11 +110,14 @@ export const PLATFORMS: Readonly<Record<PlatformId, Platform>> = deepFreeze({
     media: ["image", "video"],
     adultPlatform: false,
   },
-  x: {
-    id: "x",
-    label: "X",
+  telegram: {
+    id: "telegram",
+    label: "Telegram",
     accepts: ["safe"],
     media: ["image", "video"],
+    // Bot API: 10 MB for a photo, 50 MB for other files, both via
+    // multipart/form-data. Caption limit 1024 characters. Confirmed against the
+    // Bot API docs, not assumed.
     adultPlatform: false,
   },
   tiktok: {
