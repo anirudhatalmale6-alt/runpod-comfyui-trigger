@@ -38,6 +38,10 @@ import {
   publishPost,
   MAX_BLOB_BYTES,
 } from "../utils/blueskyClient.js";
+import {
+  publishToTelegram,
+  telegramCredentialsFromEnv,
+} from "../utils/telegramClient.js";
 import { tigrisClient } from "../utils/storageClient.js";
 import { requireEnv } from "../utils/env.js";
 
@@ -193,10 +197,10 @@ export const publishOne = task({
     // this is the run that actually posts.
     assertPublishAllowed(payload.platform, asset);
 
-    if (payload.platform !== "bluesky") {
+    if (payload.platform !== "bluesky" && payload.platform !== "telegram") {
       throw new AbortTaskRunError(
-        `No adapter is built for ${payload.platform} yet. Bluesky is live; Telegram is next, ` +
-          `and Instagram, Facebook, TikTok and YouTube are waiting on app review.`,
+        `No adapter is built for ${payload.platform} yet. Bluesky and Telegram are live; ` +
+          `Instagram, Facebook, TikTok and YouTube are waiting on app review.`,
       );
     }
 
@@ -208,6 +212,27 @@ export const publishOne = task({
       bytes: media.bytes.byteLength,
       usedWebDerivative: media.key !== asset.key,
     });
+
+    if (payload.platform === "telegram") {
+      // Telegram's photo ceiling is 10 MB against Bluesky's 1,000,000 bytes, so
+      // this lane carries the master render and fetchForPlatform never reaches
+      // for the -web derivative.
+      const result = await publishToTelegram(telegramCredentialsFromEnv(), {
+        bytes: media.bytes,
+        filename: media.key.split("/").pop() ?? "render",
+        mimeType: media.mimeType,
+        kind: asset.kind,
+        caption: payload.text,
+        asset,
+      });
+      logger.info(
+        result.url
+          ? `Published to Telegram: ${result.url}`
+          : `Published to Telegram, message ${result.messageId} (private channel, no permalink)`,
+        { messageId: result.messageId, url: result.url },
+      );
+      return { platform: payload.platform, messageId: result.messageId, url: result.url };
+    }
 
     const session = await createSession(blueskyCredentialsFromEnv());
     const result = await publishPost(session, {
@@ -278,7 +303,7 @@ export const publishPlanner = schedules.task({
     for (const post of plan.scheduled) {
       // Only lanes with a working adapter are dispatched. The rest are planned
       // and reported so the schedule is visible before the adapters exist.
-      if (post.platform !== "bluesky") {
+      if (post.platform !== "bluesky" && post.platform !== "telegram") {
         logger.info(`Planned (no adapter yet): ${post.platform} ${post.asset.key}`, {
           scheduledFor: post.scheduledFor.toISOString(),
         });
