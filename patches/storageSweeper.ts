@@ -210,6 +210,12 @@ export function sweepDryRunFromEnv(env: NodeJS.ProcessEnv = process.env): boolea
  * identifiers — and having it in the trace means ONE run tells you whether the
  * config is right, instead of a round trip per guess. Access keys are reported
  * only as present/absent with a length.
+ *
+ * BOTH halves of each credential pair are checked. Patch 2 only reported the
+ * access key id, so a missing *_SECRET_ACCESS_KEY was invisible here and only
+ * surfaced later as requireEnv() throwing mid-migration — which is exactly what
+ * happened. A diagnostic that omits a required variable is worse than useless:
+ * it actively reassures you about a thing it never looked at.
  */
 function logResolvedConfig(): void {
   const describe = (name: string) => {
@@ -245,13 +251,15 @@ function logResolvedConfig(): void {
       endpoint: tigrisEndpoint + endpointNote(tigrisEndpoint),
       region: describe("TIGRIS_REGION"),
       bucket: describe("TIGRIS_BUCKET_NAME"),
-      credentials: secret("TIGRIS_AWS_ACCESS_KEY_ID", "TIGRIS_ACCESS_KEY_ID"),
+      accessKeyId: secret("TIGRIS_AWS_ACCESS_KEY_ID", "TIGRIS_ACCESS_KEY_ID"),
+      secretAccessKey: secret("TIGRIS_AWS_SECRET_ACCESS_KEY", "TIGRIS_SECRET_ACCESS_KEY"),
     },
     backblaze: {
       endpoint: backblazeEndpoint + endpointNote(backblazeEndpoint),
       region: describe("BACKBLAZE_REGION"),
       bucket: describe("BACKBLAZE_BUCKET_NAME"),
-      credentials: secret("BACKBLAZE_AWS_ACCESS_KEY_ID", "BACKBLAZE_ACCESS_KEY_ID"),
+      accessKeyId: secret("BACKBLAZE_AWS_ACCESS_KEY_ID", "BACKBLAZE_ACCESS_KEY_ID"),
+      secretAccessKey: secret("BACKBLAZE_AWS_SECRET_ACCESS_KEY", "BACKBLAZE_SECRET_ACCESS_KEY"),
     },
     dryRun: sweepDryRunFromEnv(),
     patchVersion: PATCH_VERSION,
@@ -259,7 +267,7 @@ function logResolvedConfig(): void {
 }
 
 /** Bumped whenever this file changes, so a trace proves which version ran. */
-export const PATCH_VERSION = "sweeper-patch-2 (self-diagnosing)";
+export const PATCH_VERSION = "sweeper-patch-3 (checks secrets too)";
 
 export const weeklyStorageSweeper = schedules.task({
   id: "weekly-storage-sweeper",
