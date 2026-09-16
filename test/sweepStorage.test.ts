@@ -201,6 +201,38 @@ test('a LIVE run copies and then deletes from hot', async (t) => {
   assert.deepEqual(await keysIn(cold, COLD), ['c.txt']);
 });
 
+// The two env readers are each covered on their own above. This pins the
+// COMPOSITION of them -- i.e. the exact variable pair set in the Production
+// environment -- because that pairing is what actually arms deletion, and
+// "each half is tested" is not the same claim as "together they delete".
+//
+// STORAGE_SWEEP_MIN_AGE_DAYS=0 is the temporary override used to prove the
+// delete path without waiting for an object to age past the 7-day default.
+test('env pair STORAGE_SWEEP_DRY_RUN=false + MIN_AGE_DAYS=0 really deletes', async (t) => {
+  if (!requireS3(t)) return;
+  const { sweepMinAgeDaysFromEnv } = await import(join(tempDir!, 'storageSweeper.ts'));
+  await emptyBucket(hot, HOT);
+  await emptyBucket(cold, COLD);
+  await put(HOT, 'fresh-render.jpeg', 'seven!!');
+
+  const env = { STORAGE_SWEEP_DRY_RUN: 'false', STORAGE_SWEEP_MIN_AGE_DAYS: '0' };
+  const dryRun = sweepDryRunFromEnv(env);
+  const minAgeDays = sweepMinAgeDaysFromEnv(env);
+  assert.equal(dryRun, false, 'this pair must arm deletion');
+  assert.equal(minAgeDays, 0, 'a just-written object must be eligible');
+
+  const result = await sweepStorage(deps(), { dryRun, minAgeDays });
+
+  assert.equal(result.scanned, 1);
+  assert.equal(result.skippedTooNew, 0, 'the age filter must not hold back a fresh object at 0');
+  assert.equal(result.migrated, 1);
+  assert.equal(result.deleted, 1);
+  assert.deepEqual(result.failed, []);
+  // Server state, not the return value.
+  assert.deepEqual(await keysIn(hot, HOT), [], 'hot really is empty on the server');
+  assert.deepEqual(await keysIn(cold, COLD), ['fresh-render.jpeg'], 'the file really is in cold');
+});
+
 test('dryRun defaults to FALSE for direct callers, preserving the original behaviour', async (t) => {
   if (!requireS3(t)) return;
   await emptyBucket(hot, HOT);
