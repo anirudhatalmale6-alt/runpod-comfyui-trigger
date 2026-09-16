@@ -109,8 +109,14 @@ fi
 # or runs npm, because silently mutating someone's manifest is not install.sh's
 # business.
 # ---------------------------------------------------------------------------
-NEEDED=$(grep -ho "from ['\"][^'\"]*['\"]" $(find "$HERE/src" -name '*.ts' -not -name '*.test.ts') 2>/dev/null \
-  | sed "s/from ['\"]//; s/['\"]//" \
+# The specifier must come from a REAL import statement, so the match is anchored
+# to the start of a line. An unanchored "from \"...\"" also matches prose inside a
+# template literal -- `... read any of [x] from "${bucket}": ...` produced a
+# cheerful recommendation to run `npm install ${bucket}`. Second false positive
+# this check has had; both told the client to install something that is not a
+# package, which is worse than saying nothing.
+NEEDED=$(grep -hoE "^(import .*|\} )from ['\"][^'\"]*['\"]" $(find "$HERE/src" -name '*.ts' -not -name '*.test.ts') 2>/dev/null \
+  | sed -E "s/.*from ['\"]//; s/['\"]//" \
   | grep -v '^\.' \
   | grep -v '^node:' \
   | grep -v '^@trigger\.dev/' \
