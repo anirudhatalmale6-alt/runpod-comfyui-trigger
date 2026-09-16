@@ -218,15 +218,23 @@ test('assertPublishAllowed permits what it should', () => {
 // --- cadence -----------------------------------------------------------------
 
 test('the daily limit is the stricter of the cadence and the API ceiling', () => {
-  // Configured 3 posts/day is below Instagram's 25, so the cadence wins.
-  assert.equal(dailyLimitFor('instagram', 'image'), 3);
-  // Configured 1 video/day is below YouTube's ~6, so the cadence wins there too.
-  assert.equal(dailyLimitFor('youtube', 'video'), 1);
+  // Configured 5 posts/day is below Instagram's 25, so the cadence wins.
+  assert.equal(dailyLimitFor('instagram', 'image'), 5);
+  // Configured 4 videos/day is below YouTube's ~6, so the cadence wins there too.
+  // 4 rather than 5 deliberately: 5 uploads is 8000 of 10,000 quota units and
+  // leaves nothing for metadata calls or the retry of a failed upload.
+  assert.equal(dailyLimitFor('youtube', 'video'), 4);
   // Raising the cadence past a ceiling must clamp, not exceed it.
   assert.equal(dailyLimitFor('instagram', 'image', { maxPostsPerDay: 100, maxVideosPerDay: 100 }), 25);
   assert.equal(dailyLimitFor('youtube', 'video', { maxPostsPerDay: 100, maxVideosPerDay: 100 }), 6);
   // No documented ceiling does not mean unlimited — the cadence still applies.
   assert.equal(dailyLimitFor('bluesky', 'image', { maxPostsPerDay: 4, maxVideosPerDay: 1 }), 4);
+  // The video cadence must leave YouTube quota headroom rather than sitting on
+  // the ceiling. If this ever fails, someone raised it without a quota increase.
+  assert.ok(
+    DEFAULT_CADENCE.maxVideosPerDay < PLATFORMS.youtube.apiCeilingPerDay!,
+    'video cadence must stay strictly under YouTube\'s ceiling, not equal to it',
+  );
 });
 
 test('a platform that cannot publish a kind has a limit of zero, not the cadence', () => {

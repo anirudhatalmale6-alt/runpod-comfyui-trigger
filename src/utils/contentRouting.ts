@@ -312,17 +312,25 @@ export interface Cadence {
 }
 
 /**
- * The agreed cadence: 2-3 posts or 1 video per day, per platform.
+ * The agreed cadence: up to 5 posts per platform per 24h.
  *
- * Chosen by the client to look like a person rather than a feed, and it sits far
+ * Chosen by the client to look like a person rather than a feed, and it stays
  * below every API ceiling. That is worth being explicit about, because it
  * changes what the rate limiter is FOR: it is not a throttle holding the
  * account back, it is a backstop against this code misbehaving — a retry storm,
  * a duplicated fan-out, a scheduling bug draining the queue at once.
+ *
+ * Videos are capped lower than stills, at 4, and the reason is YouTube's quota
+ * rather than anything about pacing. An upload costs roughly 1600 of the 10,000
+ * units a project gets per day. Five uploads is 8000, which leaves almost
+ * nothing for the metadata calls and the retry of a failed upload — and when
+ * the quota runs out it is gone until the daily reset, so the failure lands on
+ * everything else that day too. Four is 6400 and leaves real headroom. Raise it
+ * once a quota increase has actually been granted, not before.
  */
 export const DEFAULT_CADENCE: Readonly<Cadence> = Object.freeze({
-  maxPostsPerDay: 3,
-  maxVideosPerDay: 1,
+  maxPostsPerDay: 5,
+  maxVideosPerDay: 4,
 });
 
 /**
