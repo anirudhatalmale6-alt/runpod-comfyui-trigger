@@ -42,6 +42,7 @@ import {
   publishToTelegram,
   telegramCredentialsFromEnv,
 } from "../utils/telegramClient.js";
+import { generateCaption, fallbackCaption } from "../utils/captionGenerator.js";
 import { tigrisClient } from "../utils/storageClient.js";
 import { requireEnv } from "../utils/env.js";
 
@@ -176,9 +177,50 @@ export interface PublishOnePayload {
   key: string;
   kind: MediaKind;
   platform: PlatformId;
-  /** Caption. Milestone 2 generates these; until then a passed-in string. */
-  text: string;
+  /**
+   * Caption OVERRIDE. Omit it and one is generated for this platform.
+   *
+   * Supplying it explicitly is what makes a manual test run from the dashboard
+   * console free and deterministic — no OpenAI call, no variation.
+   */
+  text?: string;
   altText?: string;
+}
+
+/**
+ * Resolve the caption for a post.
+ *
+ * Generation failures THROW. A silent fall back to a placeholder would publish
+ * "New image: render-01.jpg" for weeks before anyone noticed captions had
+ * stopped being written — the same shape as a job that logs an error and
+ * returns normally. Set CAPTIONS_ENABLED=false to opt out deliberately, which
+ * is a different thing from failing.
+ */
+export async function resolveCaption(
+  payload: PublishOnePayload,
+  asset: AssetRef,
+): Promise<string> {
+  if (typeof payload.text === "string" && payload.text.trim() !== "") {
+    return payload.text;
+  }
+
+  const context = {
+    asset,
+    platform: payload.platform,
+    ...(process.env.PROMO_LINK_URL ? { linkUrl: process.env.PROMO_LINK_URL.trim() } : {}),
+    ...(process.env.CAPTION_INTENSITY
+      ? { intensity: process.env.CAPTION_INTENSITY.trim() as "soft" | "direct" | "hard" }
+      : {}),
+  };
+
+  // Only the exact string "false" opts out, the same rule as every other flag
+  // in this project, so a typo cannot silently disable caption generation.
+  if ((process.env.CAPTIONS_ENABLED ?? "").trim().toLowerCase() === "false") {
+    logger.info("Caption generation is disabled; using the plain fallback.");
+    return fallbackCaption(context);
+  }
+
+  return generateCaption(context);
 }
 
 export const publishOne = task({
@@ -204,8 +246,10 @@ export const publishOne = task({
       );
     }
 
+    const caption = await resolveCaption(payload, asset);
     const media = await fetchForPlatform(asset, payload.platform);
     logger.info("Publishing", {
+      captionGenerated: payload.text === undefined,
       platform: payload.platform,
       assetKey: asset.key,
       bytesFrom: media.key,
@@ -222,7 +266,7 @@ export const publishOne = task({
         filename: media.key.split("/").pop() ?? "render",
         mimeType: media.mimeType,
         kind: asset.kind,
-        caption: payload.text,
+        caption,
         asset,
       });
       logger.info(
@@ -236,7 +280,7 @@ export const publishOne = task({
 
     const session = await createSession(blueskyCredentialsFromEnv());
     const result = await publishPost(session, {
-      text: payload.text,
+      text: caption,
       asset,
       langs: ["en"],
       ...(asset.kind === "image"
@@ -247,7 +291,7 @@ export const publishOne = task({
                 mimeType: media.mimeType,
                 // Alt text is required by the lexicon. Falling back to the
                 // caption is better than an empty string for a screen reader.
-                alt: payload.altText ?? payload.text.slice(0, 280),
+                alt: payload.altText ?? caption.slice(0, 280),
               },
             ],
           }
@@ -315,7 +359,10 @@ export const publishPlanner = schedules.task({
           key: post.asset.key,
           kind: post.asset.kind,
           platform: post.platform,
-          text: `New render — ${post.asset.key.split("/").pop()}`,
+          // No text: publish-one generates a per-platform caption at its slot.
+          // Generating here would produce one caption reused across every
+          // destination, which is the cross-posting fingerprint the staggered
+          // scheduling exists to avoid.
         },
         {
           delay: post.scheduledFor,

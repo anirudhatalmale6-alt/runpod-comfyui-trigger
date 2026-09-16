@@ -26,6 +26,7 @@ const root = join(here, "..");
 /** Order matters: each file may only depend on ones already above it. */
 const MODULES = [
   "src/utils/contentRouting.ts",
+  "src/utils/captionGenerator.ts",
   "src/utils/publishScheduler.ts",
   "src/utils/blueskyClient.ts",
   "src/utils/telegramClient.ts",
@@ -41,6 +42,8 @@ const KEEP = [
 ];
 
 const sections = [];
+/** Relative specifiers that were stripped, to be checked against MODULES. */
+const stripped_specifiers = new Set();
 
 for (const relative of MODULES) {
   const source = readFileSync(join(root, relative), "utf8");
@@ -48,8 +51,11 @@ for (const relative of MODULES) {
   // Drop every import of a module that is being inlined. Matches both single
   // line and multi-line forms. Anything in KEEP is re-added at the top instead.
   const stripped = source.replace(
-    /^import\s+(?:type\s+)?\{[\s\S]*?\}\s+from\s+["'][^"']+["'];\s*$/gm,
-    (match) => (KEEP.some((k) => match.includes(k.split(" from ")[1])) ? "" : ""),
+    /^import\s+(?:type\s+)?\{[\s\S]*?\}\s+from\s+["']([^"']+)["'];\s*$/gm,
+    (match, specifier) => {
+      if (specifier.startsWith(".")) stripped_specifiers.add(specifier);
+      return "";
+    },
   );
 
   sections.push(
@@ -139,6 +145,32 @@ let output = `${header}\n${sections.join("\n\n")}\n`;
 mkdirSync(join(root, "standalone"), { recursive: true });
 const target = join(root, "standalone", "publishPipeline.standalone.ts");
 writeFileSync(target, output);
+
+// EVERY stripped relative import must correspond to a module that was inlined.
+//
+// Without this, adding a new file to src/ and forgetting to list it in MODULES
+// produces a bundle where its import is removed and its functions are simply
+// undefined at runtime — no build error, no missing import to spot, just a
+// crash on the first call in production. That happened the moment
+// captionGenerator.ts was added, and neither existing guard noticed.
+{
+  const inlined = new Set(
+    MODULES.map((m) => m.split("/").pop().replace(/\.ts$/, "")),
+  );
+  const orphans = [...stripped_specifiers].filter((specifier) => {
+    if (KEEP.some((k) => k.includes(`"${specifier}"`))) return false;
+    const name = specifier.split("/").pop().replace(/\.(js|ts)$/, "");
+    return !inlined.has(name);
+  });
+  if (orphans.length > 0) {
+    console.error(
+      `BUILD FAILED — these imports were stripped but never inlined:\n  ${orphans.join("\n  ")}\n` +
+        `Add the module to MODULES (in dependency order) or to KEEP. Leaving it out produces a ` +
+        `bundle whose functions are undefined at runtime with no build error.`,
+    );
+    process.exit(1);
+  }
+}
 
 // Guards. A bundler that silently drops the safety rail would produce a file
 // that deploys happily and publishes explicit content to six platforms.

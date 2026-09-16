@@ -29,7 +29,7 @@ before(async () => {
   tempDir = join(here, '.generated-pipeline');
   mkdirSync(tempDir, { recursive: true });
 
-  for (const name of ['contentRouting', 'publishScheduler', 'blueskyClient', 'telegramClient']) {
+  for (const name of ['contentRouting', 'publishScheduler', 'blueskyClient', 'telegramClient', 'captionGenerator']) {
     const src = readFileSync(join(here, '..', 'src', 'utils', `${name}.ts`), 'utf8');
     writeFileSync(
       join(tempDir, `${name}.ts`),
