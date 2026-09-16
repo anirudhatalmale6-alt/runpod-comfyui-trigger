@@ -106,7 +106,13 @@ before(async () => {
     // so the module loads without Trigger.dev installed here.
     .replace(
       /import \{ schedules, logger \} from "@trigger\.dev\/sdk\/v3";/,
-      'const schedules: any = { task: (d: any) => d };\nconst logger: any = { warn() {}, info() {}, error() {} };',
+      'const schedules: any = { task: (d: any) => d };\n' +
+        'const __logs: any[] = [];\n' +
+        'const logger: any = {\n' +
+        '  warn(m: string, d?: any) { __logs.push({ level: "warn", message: m, data: d }); },\n' +
+        '  info(m: string, d?: any) { __logs.push({ level: "info", message: m, data: d }); },\n' +
+        '  error(m: string, d?: any) { __logs.push({ level: "error", message: m, data: d }); },\n' +
+        '};',
     );
 
   assert.ok(!rewritten.includes('utils/storageClient.js'), 'storageClient import must be stubbed');
@@ -120,7 +126,10 @@ before(async () => {
   tempDir = join(fileURLToPath(new URL('.', import.meta.url)), '.generated');
   mkdirSync(tempDir, { recursive: true });
   const file = join(tempDir, 'storageSweeper.ts');
-  writeFileSync(file, rewritten);
+  // Expose the captured log lines so the diagnostic banner can be asserted on.
+  // The banner is the thing that has twice turned an open-ended round-trip loop
+  // into a single screenshot; leaving it untested is how it drifts.
+  writeFileSync(file, rewritten + '\nexport const __capturedLogs = __logs;\n');
 
   const mod = await import(file);
   sweepStorage = mod.sweepStorage;
@@ -231,6 +240,97 @@ test('env pair STORAGE_SWEEP_DRY_RUN=false + MIN_AGE_DAYS=0 really deletes', asy
   // Server state, not the return value.
   assert.deepEqual(await keysIn(hot, HOT), [], 'hot really is empty on the server');
   assert.deepEqual(await keysIn(cold, COLD), ['fresh-render.jpeg'], 'the file really is in cold');
+});
+
+// ---------------------------------------------------------------------------
+// patch 6: the dry-run flag diagnoses itself, and a failed sweep fails the RUN.
+// ---------------------------------------------------------------------------
+
+test('STORAGE_SWEEP_FAIL_ON_ERROR: only the exact string "false" keeps a broken run green', async () => {
+  const { sweepFailOnErrorFromEnv } = await import(join(tempDir!, 'storageSweeper.ts'));
+  assert.equal(sweepFailOnErrorFromEnv({}), true, 'unset must FAIL the run, so a silent breakage is impossible');
+  assert.equal(sweepFailOnErrorFromEnv({ STORAGE_SWEEP_FAIL_ON_ERROR: '' }), true);
+  assert.equal(sweepFailOnErrorFromEnv({ STORAGE_SWEEP_FAIL_ON_ERROR: 'true' }), true);
+  assert.equal(sweepFailOnErrorFromEnv({ STORAGE_SWEEP_FAIL_ON_ERROR: 'nope' }), true, 'a typo must not silence it');
+  assert.equal(sweepFailOnErrorFromEnv({ STORAGE_SWEEP_FAIL_ON_ERROR: 'false' }), false);
+  assert.equal(sweepFailOnErrorFromEnv({ STORAGE_SWEEP_FAIL_ON_ERROR: ' FALSE ' }), false, 'trimmed, case-insensitive');
+});
+
+// The real-world case this exists for: the dashboard showed `false`, the run
+// still reported DRY RUN, and nothing in the trace explained the contradiction.
+// Every invisible cause is visible in the LENGTH.
+test('the banner explains WHY a dry-run flag that looks right did not arm deletion', async () => {
+  const mod: any = await import(join(tempDir!, 'storageSweeper.ts'));
+  const logs = mod.__capturedLogs;
+
+  const bannerFor = (value: string | undefined) => {
+    logs.length = 0;
+    const previous = process.env.STORAGE_SWEEP_DRY_RUN;
+    if (value === undefined) delete process.env.STORAGE_SWEEP_DRY_RUN;
+    else process.env.STORAGE_SWEEP_DRY_RUN = value;
+    mod.logResolvedConfig();
+    if (previous === undefined) delete process.env.STORAGE_SWEEP_DRY_RUN;
+    else process.env.STORAGE_SWEEP_DRY_RUN = previous;
+    const entry = logs.find((l: any) => l.message === 'Storage configuration in use');
+    assert.ok(entry, 'the banner must always be logged');
+    return entry.data;
+  };
+
+  const clean = bannerFor('false');
+  assert.equal(clean.dryRun, false);
+  assert.match(clean.STORAGE_SWEEP_DRY_RUN, /DELETION IS ARMED/);
+
+  // Quotes survive a paste and are invisible in a dashboard text box.
+  const quoted = bannerFor('"false"');
+  assert.equal(quoted.dryRun, true, 'strictness is deliberate: a destructive flag is never guessed at');
+  assert.match(quoted.STORAGE_SWEEP_DRY_RUN, /DRY RUN/);
+  assert.match(quoted.STORAGE_SWEEP_DRY_RUN, /length 7/, 'the length is what gives the cause away');
+  assert.match(quoted.STORAGE_SWEEP_DRY_RUN, /CONTAINS "false" but is not equal/);
+
+  // Measured, not assumed. trim() is more capable than it looks: it DOES strip
+  // U+00A0, U+FEFF and U+2007, so those must arm deletion rather than be flagged.
+  // Written as escapes on purpose -- an invisible character in source is one
+  // careless copy away from becoming an ordinary space.
+  for (const [name, ch] of [['U+00A0', '\u00A0'], ['U+FEFF', '\uFEFF'], ['U+2007', '\u2007']] as const) {
+    const trimmed = bannerFor('false' + ch);
+    assert.equal(trimmed.dryRun, false, `trim() handles ${name}, so this must still arm deletion`);
+    assert.match(trimmed.STORAGE_SWEEP_DRY_RUN, /DELETION IS ARMED/);
+  }
+
+  // A zero-width space is what actually survives trim().
+  const zwsp = bannerFor('false\u200B');
+  assert.equal(zwsp.dryRun, true, 'U+200B is not whitespace to trim()');
+  assert.match(zwsp.STORAGE_SWEEP_DRY_RUN, /length 6/);
+
+  const comma = bannerFor('false,');
+  assert.equal(comma.dryRun, true);
+  assert.match(comma.STORAGE_SWEEP_DRY_RUN, /length 6/);
+
+  const unset = bannerFor(undefined);
+  assert.equal(unset.dryRun, true);
+  assert.match(unset.STORAGE_SWEEP_DRY_RUN, /not set/);
+
+  // Ordinary whitespace IS trimmed, so this one must genuinely arm deletion.
+  const padded = bannerFor('  FALSE\n');
+  assert.equal(padded.dryRun, false, 'plain whitespace and case are handled, and must not be flagged');
+  assert.match(padded.STORAGE_SWEEP_DRY_RUN, /DELETION IS ARMED/);
+});
+
+test('the banner never lets a typo in MIN_AGE_DAYS read as 0', async () => {
+  const mod: any = await import(join(tempDir!, 'storageSweeper.ts'));
+  const logs = mod.__capturedLogs;
+  const previous = process.env.STORAGE_SWEEP_MIN_AGE_DAYS;
+
+  logs.length = 0;
+  process.env.STORAGE_SWEEP_MIN_AGE_DAYS = 'seven';
+  mod.logResolvedConfig();
+  const data = logs.find((l: any) => l.message === 'Storage configuration in use').data;
+
+  if (previous === undefined) delete process.env.STORAGE_SWEEP_MIN_AGE_DAYS;
+  else process.env.STORAGE_SWEEP_MIN_AGE_DAYS = previous;
+
+  assert.equal(data.minAgeDays, 7, 'a typo falls back to 7, never to 0');
+  assert.match(data.STORAGE_SWEEP_MIN_AGE_DAYS, /not a usable number/);
 });
 
 test('dryRun defaults to FALSE for direct callers, preserving the original behaviour', async (t) => {

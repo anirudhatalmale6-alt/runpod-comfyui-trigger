@@ -244,6 +244,29 @@ export function sweepDryRunFromEnv(env: NodeJS.ProcessEnv = process.env): boolea
  * An unparseable or negative value falls back to 7 rather than to 0 — a typo
  * must never silently turn into "sweep everything immediately".
  */
+/**
+ * Should a sweep that failed on one or more objects mark the RUN as failed?
+ *
+ * Default: yes. This matters more than it looks for an unattended system.
+ *
+ * Until patch 6 the task logged `logger.error` per failure and then returned
+ * normally, so Trigger.dev recorded the run as **Completed**. A sweep that
+ * failed on every single object was indistinguishable, at a glance and to any
+ * alerting rule, from one that worked perfectly. On a weekly cron nobody is
+ * watching, that is a failure that never gets found.
+ *
+ * Failing the run is safe: a failed copy never deletes its source (there is a
+ * test for exactly that), so a red run means "not archived yet", never
+ * "lost". The cron comes round again next week regardless.
+ *
+ * Set STORAGE_SWEEP_FAIL_ON_ERROR=false to restore the old always-green
+ * behaviour. As everywhere else in this file, only the exact string "false"
+ * changes anything.
+ */
+export function sweepFailOnErrorFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (env.STORAGE_SWEEP_FAIL_ON_ERROR ?? "").trim().toLowerCase() !== "false";
+}
+
 export function sweepMinAgeDaysFromEnv(env: NodeJS.ProcessEnv = process.env): number {
   const raw = (env.STORAGE_SWEEP_MIN_AGE_DAYS ?? "").trim();
   if (raw === "") return 7;
@@ -266,7 +289,7 @@ export function sweepMinAgeDaysFromEnv(env: NodeJS.ProcessEnv = process.env): nu
  * happened. A diagnostic that omits a required variable is worse than useless:
  * it actively reassures you about a thing it never looked at.
  */
-function logResolvedConfig(): void {
+export function logResolvedConfig(): void {
   const describe = (name: string) => {
     const raw = process.env[name];
     if (raw === undefined) return "(not set)";
@@ -308,6 +331,55 @@ function logResolvedConfig(): void {
     }
   };
 
+  // The dry-run flag is deliberately strict: ONLY the exact string "false",
+  // after trim and lowercase, arms deletion. That is right — a destructive flag
+  // must never be enabled by a guess about what someone meant.
+  //
+  // But strictness without diagnosis is how you get a Production run that says
+  // DRY RUN while the dashboard plainly shows `false`, with nothing in the trace
+  // explaining the contradiction.
+  //
+  // Every cause is visible in the LENGTH, because `false` is exactly 5. Measured
+  // rather than assumed — .trim() is more capable than it looks, and the list of
+  // what actually survives it is short:
+  //
+  //   handled by trim(): space, tab, newline, U+00A0 no-break space,
+  //                      U+FEFF BOM, U+2007 figure space
+  //   NOT handled:       quotation marks ("false" -> 7), a trailing comma
+  //                      (false, -> 6), a zero-width space (U+200B -> 6)
+  //
+  // So: report the raw length, and say outright which way it resolved and why.
+  const dryRunNote = () => {
+    const raw = process.env.STORAGE_SWEEP_DRY_RUN;
+    if (raw === undefined) {
+      return "(not set) -> DRY RUN. Nothing will be deleted. Set it to exactly: false";
+    }
+    const normalised = raw.trim().toLowerCase();
+    if (normalised === "false") {
+      return `"${raw}" (length ${raw.length}) -> DELETION IS ARMED`;
+    }
+    const hint =
+      normalised.includes("false")
+        ? ` The value CONTAINS "false" but is not equal to it, so deletion stays OFF. ` +
+          `Expected length 5, got ${raw.length}. Ordinary and non-breaking spaces are ` +
+          `already trimmed, so the extra character(s) are most likely quotation marks, ` +
+          `a trailing comma, or a zero-width space. Retype the value by hand as the ` +
+          `five letters f-a-l-s-e rather than pasting it.`
+        : ` Anything other than exactly "false" means DRY RUN, by design.`;
+    return `"${raw}" (length ${raw.length}) -> DRY RUN.${hint}`;
+  };
+
+  const minAgeNote = () => {
+    const raw = process.env.STORAGE_SWEEP_MIN_AGE_DAYS;
+    if (raw === undefined || raw.trim() === "") return "(not set) -> default 7 day(s)";
+    const parsed = Number(raw.trim());
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      return `"${raw}" is not a usable number -> falling back to 7 day(s). ` +
+        `A typo must never be read as 0, which would sweep everything.`;
+    }
+    return `"${raw}" -> ${parsed} day(s)`;
+  };
+
   const tigrisEndpoint = describe("TIGRIS_ENDPOINT");
   const backblazeEndpoint = describe("BACKBLAZE_ENDPOINT");
 
@@ -327,13 +399,16 @@ function logResolvedConfig(): void {
       secretAccessKey: secret("BACKBLAZE_AWS_SECRET_ACCESS_KEY", "BACKBLAZE_SECRET_ACCESS_KEY"),
     },
     dryRun: sweepDryRunFromEnv(),
+    STORAGE_SWEEP_DRY_RUN: dryRunNote(),
     minAgeDays: sweepMinAgeDaysFromEnv(),
+    STORAGE_SWEEP_MIN_AGE_DAYS: minAgeNote(),
+    failOnError: sweepFailOnErrorFromEnv(),
     patchVersion: PATCH_VERSION,
   });
 }
 
 /** Bumped whenever this file changes, so a trace proves which version ran. */
-export const PATCH_VERSION = "sweeper-patch-5 (7-day age filter)";
+export const PATCH_VERSION = "sweeper-patch-6 (diagnoses the dry-run flag, fails loudly)";
 
 export const weeklyStorageSweeper = schedules.task({
   id: "weekly-storage-sweeper",
@@ -395,6 +470,20 @@ export const weeklyStorageSweeper = schedules.task({
       // trace is enough to diagnose without another round trip.
       for (const item of result.failed) {
         logger.error(`FAILED: ${item.key} — ${item.error}`, { key: item.key, error: item.error });
+      }
+
+      // Then make the RUN itself fail, so this is visible without reading logs.
+      // See sweepFailOnErrorFromEnv: a green run that failed on every object is
+      // the worst possible outcome for a weekly unattended cron.
+      if (sweepFailOnErrorFromEnv()) {
+        const first = result.failed[0]!;
+        throw new Error(
+          `Storage sweep failed on ${result.failed.length} of ${result.scanned} object(s). ` +
+            `First failure: ${first.key} — ${first.error}. ` +
+            `Nothing was deleted for the failed objects, so they are still in hot storage. ` +
+            `Per-object detail is in the FAILED log lines above. ` +
+            `(Set STORAGE_SWEEP_FAIL_ON_ERROR=false to let the run stay green instead.)`,
+        );
       }
     } else if (result.scanned === 0) {
       logger.warn(
