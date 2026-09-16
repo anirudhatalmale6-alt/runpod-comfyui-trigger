@@ -95,6 +95,48 @@ if [ ! -f "$TARGET/.env.example" ]; then
   echo "  installed .env.example (placeholders only)"
 fi
 
+# ---------------------------------------------------------------------------
+# Dependency check.
+#
+# Copying a source file that imports a package the TARGET does not depend on
+# produces "Cannot find module '…'" at deploy or run time — which reads as
+# "the file you sent me is broken" rather than "run npm install". Same failure
+# shape as the two omissions above, one layer out: the thing that is missing is
+# invisible until something else tries to use it.
+#
+# Collect bare specifiers from the installed files and report any the target's
+# package.json does not already list. Read-only: this never edits package.json
+# or runs npm, because silently mutating someone's manifest is not install.sh's
+# business.
+# ---------------------------------------------------------------------------
+NEEDED=$(grep -ho "from ['\"][^'\"]*['\"]" $(find "$HERE/src" -name '*.ts' -not -name '*.test.ts') 2>/dev/null \
+  | sed "s/from ['\"]//; s/['\"]//" \
+  | grep -v '^\.' \
+  | grep -v '^node:' \
+  | grep -v '^@trigger\.dev/' \
+  | grep -v '^@/' \
+  | sed 's|^\(@[^/]*/[^/]*\).*|\1|; s|^\([^@][^/]*\).*|\1|' \
+  | sort -u)
+
+MISSING=""
+for pkg in $NEEDED; do
+  if ! grep -q "\"$pkg\"" "$TARGET/package.json" 2>/dev/null; then
+    MISSING="$MISSING $pkg"
+  fi
+done
+
+if [ -n "$MISSING" ]; then
+  echo ""
+  echo "  ! these packages are imported by the files just installed but are NOT in"
+  echo "    $TARGET/package.json. Without them the deploy fails with"
+  echo "    \"Cannot find module\", which looks like broken code and is not:"
+  echo ""
+  echo "      npm install --save$MISSING"
+  echo ""
+else
+  echo "  dependency check: every import is already in your package.json"
+fi
+
 echo ""
 echo "Still to do by hand — install.sh will not touch these:"
 echo ""
