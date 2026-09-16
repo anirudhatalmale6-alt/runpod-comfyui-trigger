@@ -1,0 +1,276 @@
+/**
+ * The routing safety rail.
+ *
+ * Every other failure in this project is recoverable. Explicit material reaching
+ * a mainstream platform is not — the account goes and the audience with it — so
+ * this file is deliberately exhaustive rather than representative. The headline
+ * test walks EVERY content class against EVERY platform and asserts the whole
+ * matrix, so a platform added later with the wrong `accepts` cannot slip past by
+ * simply not having a test written for it.
+ */
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import {
+  ALL_PLATFORMS,
+  CLASS_PREFIX,
+  DEFAULT_CADENCE,
+  PLATFORMS,
+  SOCIAL_PLATFORMS,
+  assertPublishAllowed,
+  classifyFromKey,
+  dailyLimitFor,
+  publishIdempotencyKey,
+  routeAsset,
+  type ContentClass,
+  type MediaKind,
+  type PlatformId,
+} from '../src/utils/contentRouting.ts';
+
+// --- classification ----------------------------------------------------------
+
+test('classifyFromKey reads the first path segment, exactly', () => {
+  assert.equal(classifyFromKey('safe/2026-09-16/render-01.png'), 'safe');
+  assert.equal(classifyFromKey('explicit/2026-09-16/render-01.png'), 'explicit');
+  assert.equal(classifyFromKey('safe/a/b/c/deep.png'), 'safe');
+  // A leading slash is a different key in S3, but must not defeat classification.
+  assert.equal(classifyFromKey('/safe/x.png'), 'safe');
+});
+
+test('classifyFromKey NEVER substring-matches', () => {
+  // The word "explicit" further down a safe path must not reclassify it, and
+  // more importantly the reverse must not happen either.
+  assert.equal(classifyFromKey('safe/explicit-pose/01.png'), 'safe');
+  assert.equal(classifyFromKey('explicit/safe-for-teaser/01.png'), 'explicit');
+  // "safe" appearing anywhere other than the first segment is not a class.
+  assert.equal(classifyFromKey('renders/safe/01.png'), null);
+  assert.equal(classifyFromKey('unsafe/01.png'), null);
+  assert.equal(classifyFromKey('safety/01.png'), null);
+});
+
+test('classifyFromKey is strict about case, and that asymmetry is deliberate', () => {
+  // Reading "Safe/" as safe would route a mislabelled asset to six public
+  // platforms — unrecoverable. Refusing it means nothing posts and somebody
+  // notices — recoverable. So: strict.
+  assert.equal(classifyFromKey('Safe/x.png'), null);
+  assert.equal(classifyFromKey('SAFE/x.png'), null);
+  assert.equal(classifyFromKey('Explicit/x.png'), null);
+});
+
+test('classifyFromKey returns null for anything it cannot read', () => {
+  assert.equal(classifyFromKey(''), null);
+  assert.equal(classifyFromKey('render-01.png'), null, 'a bare filename has no class');
+  assert.equal(classifyFromKey('safe'), null, 'a segment with no slash is not a prefix');
+  assert.equal(classifyFromKey('safe.png'), null);
+  assert.equal(classifyFromKey('/'), null);
+});
+
+// --- the whole matrix --------------------------------------------------------
+
+test('EVERY class against EVERY platform: explicit reaches no mainstream lane', () => {
+  const classes: ContentClass[] = ['safe', 'explicit'];
+  const kinds: MediaKind[] = ['image', 'video'];
+
+  for (const contentClass of classes) {
+    for (const kind of kinds) {
+      const asset = { key: `${CLASS_PREFIX[contentClass]}2026/a.bin`, kind };
+      const decision = routeAsset(asset);
+
+      assert.equal(decision.contentClass, contentClass);
+
+      for (const id of decision.destinations) {
+        const platform = PLATFORMS[id];
+        assert.ok(
+          platform.accepts.includes(contentClass),
+          `${id} was routed ${contentClass} content it does not accept`,
+        );
+        assert.ok(
+          platform.media.includes(kind),
+          `${id} was routed ${kind} it cannot publish`,
+        );
+      }
+
+      if (contentClass === 'explicit') {
+        for (const social of SOCIAL_PLATFORMS) {
+          assert.ok(
+            !decision.destinations.includes(social),
+            `explicit ${kind} must never route to ${social}`,
+          );
+        }
+      }
+    }
+  }
+});
+
+test('the platform table itself: no mainstream lane may ever accept explicit', () => {
+  // Guards the DATA, not just the logic. A future edit that adds "explicit" to
+  // Instagram's accepts list would pass every routing test above, because the
+  // logic would be faithfully doing what the table said.
+  for (const id of SOCIAL_PLATFORMS) {
+    assert.deepEqual(
+      [...PLATFORMS[id].accepts],
+      ['safe'],
+      `${id} is a mainstream platform and must accept safe content only`,
+    );
+  }
+  assert.ok(PLATFORMS.fanvue.accepts.includes('explicit'), 'fanvue is the explicit destination');
+});
+
+test('SOCIAL_PLATFORMS is the six mainstream lanes, and Fanvue is not one', () => {
+  assert.deepEqual(
+    [...SOCIAL_PLATFORMS].sort(),
+    ['bluesky', 'facebook', 'instagram', 'tiktok', 'x', 'youtube'],
+  );
+  assert.ok(!SOCIAL_PLATFORMS.includes('fanvue'));
+  assert.equal(SOCIAL_PLATFORMS.length, 6);
+});
+
+test('Fansly is absent from the platform table entirely', () => {
+  // It has no official API. Everything calling itself one is a third party that
+  // wants the account's session credentials. It is a manual lane, and leaving it
+  // out of the table is what makes that structural rather than a note in a file.
+  assert.ok(!ALL_PLATFORMS.includes('fansly' as PlatformId));
+});
+
+// --- fail closed, fail loud --------------------------------------------------
+
+test('an unclassifiable asset goes NOWHERE and says why', () => {
+  const decision = routeAsset({ key: 'renders/oops.png', kind: 'image' });
+  assert.deepEqual(decision.destinations, [], 'no destination at all');
+  assert.equal(decision.contentClass, null);
+  assert.ok(decision.blockedReason, 'must state a reason — silence would read as "nothing to do"');
+  assert.match(decision.blockedReason!, /Cannot classify/);
+  assert.match(decision.blockedReason!, /deliberate, not a bug/);
+});
+
+test('an unclassifiable asset does not quietly fall back to the safe lanes', () => {
+  // The specific catastrophe: treating "unknown" as "probably fine".
+  for (const key of ['renders/x.png', 'Safe/x.png', 'x.png', '']) {
+    const decision = routeAsset({ key, kind: 'image' });
+    assert.deepEqual(decision.destinations, [], `"${key}" must route nowhere`);
+  }
+});
+
+test('requesting a forbidden destination cannot obtain it', () => {
+  // Narrowing may only ever REMOVE destinations. A caller asking explicitly for
+  // Instagram with explicit content still gets refused, with the reason.
+  const decision = routeAsset({ key: 'explicit/a.png', kind: 'image' }, ['instagram', 'fanvue']);
+  assert.deepEqual(decision.destinations, ['fanvue']);
+  const refusal = decision.rejected.find((r) => r.platform === 'instagram');
+  assert.ok(refusal, 'the refusal must be reported, not silently dropped');
+  assert.match(refusal!.reason, /safe content only/);
+});
+
+test('media capability is enforced: YouTube refuses a still image', () => {
+  const decision = routeAsset({ key: 'safe/a.png', kind: 'image' });
+  assert.ok(!decision.destinations.includes('youtube'), 'a Short cannot be a still image');
+  assert.ok(decision.rejected.some((r) => r.platform === 'youtube' && /cannot publish image/.test(r.reason)));
+
+  const video = routeAsset({ key: 'safe/a.mp4', kind: 'video' });
+  assert.ok(video.destinations.includes('youtube'));
+});
+
+test('TikTok accepts images — confirmed against the Content Posting API', () => {
+  const decision = routeAsset({ key: 'safe/a.jpg', kind: 'image' });
+  assert.ok(
+    decision.destinations.includes('tiktok'),
+    'photo posts are supported, so this lane needs no image-to-video step',
+  );
+});
+
+// --- the second, independent check -------------------------------------------
+
+test('assertPublishAllowed blocks explicit content at every mainstream lane', () => {
+  for (const id of SOCIAL_PLATFORMS) {
+    assert.throws(
+      () => assertPublishAllowed(id, { key: 'explicit/a.mp4', kind: 'video' }),
+      /BLOCKED/,
+      `${id} must refuse explicit content at publish time even if something queued it`,
+    );
+  }
+});
+
+test('assertPublishAllowed is independent of routeAsset', () => {
+  // The whole point: it catches a routing bug rather than trusting the router.
+  // Hand it something no correct router would ever produce.
+  assert.throws(
+    () => assertPublishAllowed('instagram', { key: 'explicit/a.png', kind: 'image' }),
+    /refusing to publish explicit content to Instagram/,
+  );
+  assert.throws(
+    () => assertPublishAllowed('instagram', { key: 'renders/unknown.png', kind: 'image' }),
+    /classification cannot be read/,
+  );
+  assert.throws(
+    () => assertPublishAllowed('youtube', { key: 'safe/a.png', kind: 'image' }),
+    /accepts video only/,
+  );
+});
+
+test('assertPublishAllowed permits what it should', () => {
+  assert.doesNotThrow(() => assertPublishAllowed('instagram', { key: 'safe/a.png', kind: 'image' }));
+  assert.doesNotThrow(() => assertPublishAllowed('fanvue', { key: 'explicit/a.png', kind: 'image' }));
+  assert.doesNotThrow(() => assertPublishAllowed('fanvue', { key: 'safe/a.png', kind: 'image' }));
+  assert.doesNotThrow(() => assertPublishAllowed('youtube', { key: 'safe/a.mp4', kind: 'video' }));
+});
+
+// --- cadence -----------------------------------------------------------------
+
+test('the daily limit is the stricter of the cadence and the API ceiling', () => {
+  // Configured 3 posts/day is below Instagram's 25, so the cadence wins.
+  assert.equal(dailyLimitFor('instagram', 'image'), 3);
+  // Configured 1 video/day is below YouTube's ~6, so the cadence wins there too.
+  assert.equal(dailyLimitFor('youtube', 'video'), 1);
+  // Raising the cadence past a ceiling must clamp, not exceed it.
+  assert.equal(dailyLimitFor('instagram', 'image', { maxPostsPerDay: 100, maxVideosPerDay: 100 }), 25);
+  assert.equal(dailyLimitFor('youtube', 'video', { maxPostsPerDay: 100, maxVideosPerDay: 100 }), 6);
+  // No documented ceiling does not mean unlimited — the cadence still applies.
+  assert.equal(dailyLimitFor('bluesky', 'image', { maxPostsPerDay: 4, maxVideosPerDay: 1 }), 4);
+});
+
+test('a platform that cannot publish a kind has a limit of zero, not the cadence', () => {
+  assert.equal(dailyLimitFor('youtube', 'image'), 0);
+});
+
+test('the agreed cadence sits below every ceiling in the table', () => {
+  // If this ever fails, the configured rhythm has drifted above what an API
+  // will accept and the limiter has quietly become the thing blocking posts.
+  for (const id of ALL_PLATFORMS) {
+    const ceiling = PLATFORMS[id].apiCeilingPerDay;
+    if (ceiling === undefined) continue;
+    assert.ok(
+      DEFAULT_CADENCE.maxPostsPerDay <= ceiling,
+      `cadence ${DEFAULT_CADENCE.maxPostsPerDay}/day exceeds ${id}'s ceiling of ${ceiling}`,
+    );
+  }
+});
+
+// --- idempotency -------------------------------------------------------------
+
+test('the idempotency key is per asset AND per destination', () => {
+  const asset = { key: 'safe/a.png', kind: 'image' as MediaKind };
+  const bsky = publishIdempotencyKey(asset, 'bluesky');
+  const x = publishIdempotencyKey(asset, 'x');
+
+  assert.notEqual(bsky, x, 'one asset fanning out must not share a key across platforms');
+  // Otherwise a retry after "succeeded on Bluesky, failed on X" either
+  // double-posts to Bluesky or never retries X, with no way to have neither.
+  assert.equal(bsky, publishIdempotencyKey({ ...asset }, 'bluesky'), 'stable across calls');
+  assert.notEqual(
+    bsky,
+    publishIdempotencyKey({ key: 'safe/b.png', kind: 'image' }, 'bluesky'),
+    'different assets must not collide',
+  );
+});
+
+// --- the table cannot be mutated at runtime ----------------------------------
+
+test('the platform table is frozen', () => {
+  // A safety rule that can be edited at runtime is not a safety rule.
+  assert.throws(() => {
+    // @ts-expect-error deliberately violating the type to prove the freeze
+    PLATFORMS.instagram.accepts = ['safe', 'explicit'];
+  });
+  assert.deepEqual([...PLATFORMS.instagram.accepts], ['safe']);
+});
