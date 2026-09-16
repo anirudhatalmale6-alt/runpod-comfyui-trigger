@@ -231,6 +231,22 @@ function logResolvedConfig(): void {
     }
     return `NOT SET (looked for ${names.join(", ")})`;
   };
+  // Backblaze's S3-compatible API does NOT accept the master application key.
+  // A master keyId is the 12-character account id; a real application key id is
+  // 25 characters. Using the former gives "Malformed Access Key Id", which reads
+  // like a typo rather than "wrong kind of key entirely".
+  const backblazeKeyIdNote = () => {
+    const v = process.env.BACKBLAZE_AWS_ACCESS_KEY_ID ?? process.env.BACKBLAZE_ACCESS_KEY_ID;
+    if (!v || v.trim() === "") return "";
+    const len = v.trim().length;
+    if (len === 25) return " [length 25, looks like an application key id]";
+    if (len === 12) {
+      return " [length 12 - this is your ACCOUNT ID, i.e. the MASTER key. " +
+        "Backblaze's S3 API rejects the master key with 'Malformed Access Key Id'. " +
+        "Create a non-master application key scoped to the bucket.]";
+    }
+    return ` [length ${len} - expected 25 for a Backblaze application key id]`;
+  };
   // An endpoint that is not an absolute URL makes the AWS SDK throw a bare
   // "TypeError: Invalid URL" on first use, with nothing naming the endpoint.
   const endpointNote = (value: string) => {
@@ -258,7 +274,7 @@ function logResolvedConfig(): void {
       endpoint: backblazeEndpoint + endpointNote(backblazeEndpoint),
       region: describe("BACKBLAZE_REGION"),
       bucket: describe("BACKBLAZE_BUCKET_NAME"),
-      accessKeyId: secret("BACKBLAZE_AWS_ACCESS_KEY_ID", "BACKBLAZE_ACCESS_KEY_ID"),
+      accessKeyId: secret("BACKBLAZE_AWS_ACCESS_KEY_ID", "BACKBLAZE_ACCESS_KEY_ID") + backblazeKeyIdNote(),
       secretAccessKey: secret("BACKBLAZE_AWS_SECRET_ACCESS_KEY", "BACKBLAZE_SECRET_ACCESS_KEY"),
     },
     dryRun: sweepDryRunFromEnv(),
@@ -267,7 +283,7 @@ function logResolvedConfig(): void {
 }
 
 /** Bumped whenever this file changes, so a trace proves which version ran. */
-export const PATCH_VERSION = "sweeper-patch-3 (checks secrets too)";
+export const PATCH_VERSION = "sweeper-patch-4 (flags a master B2 key)";
 
 export const weeklyStorageSweeper = schedules.task({
   id: "weekly-storage-sweeper",
