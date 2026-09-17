@@ -363,6 +363,16 @@ test('LIVE: bsky.social parses our createSession body and rejects the CREDENTIAL
     return;
   }
 
+  // A 429 is inconclusive, not a failure: the server understood us perfectly
+  // and declined to answer. Failing the suite on it would mean a red build
+  // caused by how often the suite itself has run, which teaches nobody
+  // anything. It is also a reminder that this test calls a shared public
+  // service — it should be run, but not hammered.
+  if (/RateLimitExceeded|HTTP 429/i.test(error.message)) {
+    t.skip(`${BLUESKY_SERVICE} rate-limited us — inconclusive, re-run later`);
+    return;
+  }
+
   assert.match(error.message, /createSession failed/);
   assert.match(
     error.message,

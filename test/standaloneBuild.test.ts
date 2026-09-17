@@ -48,11 +48,12 @@ test('the bundle carries the safety rail and both adapters', () => {
 
 test('the bundle needs no dependency the project does not already have', () => {
   const bundle = readFileSync(bundlePath, 'utf8');
-  const imports = bundle
-    .split('\n')
-    .filter((line) => /^import\b/.test(line))
-    .map((line) => /from\s+["']([^"']+)["']/.exec(line)?.[1])
-    .filter((spec): spec is string => Boolean(spec));
+  // Parsed across the WHOLE file, not line by line. The @aws-sdk import is now
+  // multi-line, and a line-based match silently found zero specifiers for it --
+  // which made this test quietly assert less than it looked like it did.
+  const imports = [...bundle.matchAll(/^import\s[\s\S]*?from\s+["']([^"']+)["'];/gm)].map(
+    (m) => m[1]!,
+  );
 
   assert.deepEqual(imports.sort(), [
     '../utils/env.js',
