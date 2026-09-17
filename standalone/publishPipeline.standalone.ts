@@ -1420,6 +1420,22 @@ export function telegramCredentialsFromEnv(
     );
   }
 
+  // The bot's OWN username is not a destination. This one cost a real round
+  // trip: the variable held @ava_ines_publish_bot, so the bot was being told to
+  // post to itself, and Telegram answers that with "chat not found" — which
+  // reads as a wrong channel name and sends you looking in the wrong place.
+  //
+  // Telegram reserves the "bot" suffix: a username ending in bot IS a bot and
+  // cannot be a channel, so this is a safe thing to refuse outright.
+  if (/bot$/i.test(chatId)) {
+    throw new Error(
+      `TELEGRAM_CHANNEL_CHAT_ID "${chatId}" is a BOT username, not a channel. Telegram only ` +
+        `allows bots to have a username ending in "bot". This is the bot doing the posting — ` +
+        `it belongs in TELEGRAM_BOT_TOKEN, and this variable wants the CHANNEL it posts to. ` +
+        `Sending to it would fail as "chat not found", which looks like a wrong channel name.`,
+    );
+  }
+
   return { botToken, chatId };
 }
 

@@ -111,6 +111,49 @@ test('a PRIVATE CHAT id is refused, because posting there reaches nobody', () =>
   }
 });
 
+test('the BOT\'s own username is refused as a destination', () => {
+  // Observed on this project: the variable held the bot's @username, so the bot
+  // was told to post to itself. Telegram answers "chat not found", which reads
+  // as a wrong CHANNEL name and sends you hunting in entirely the wrong place.
+  assert.throws(
+    () =>
+      telegramCredentialsFromEnv({
+        TELEGRAM_BOT_TOKEN: TOKEN,
+        TELEGRAM_CHANNEL_CHAT_ID: '@ava_ines_publish_bot',
+      } as NodeJS.ProcessEnv),
+    /is a BOT username, not a channel/,
+  );
+  // The suffix is what identifies it, and Telegram reserves it, so case and
+  // separator must not matter.
+  for (const chatId of ['@AvaPublishBot', '@ava_publish_BOT', '@somethingbot']) {
+    assert.throws(
+      () =>
+        telegramCredentialsFromEnv({
+          TELEGRAM_BOT_TOKEN: TOKEN,
+          TELEGRAM_CHANNEL_CHAT_ID: chatId,
+        } as NodeJS.ProcessEnv),
+      /BOT username/,
+      `${chatId} is a bot username`,
+    );
+  }
+});
+
+test('the bot-username guard does not swallow legitimate channel names', () => {
+  // "bot" must be the SUFFIX, not merely present. A channel called @botanicals
+  // is a perfectly good destination and refusing it would be a worse bug than
+  // the one the guard exists to catch.
+  for (const chatId of ['@botanicals', '@robotics_daily', '@AvaInesOfficial']) {
+    assert.doesNotThrow(
+      () =>
+        telegramCredentialsFromEnv({
+          TELEGRAM_BOT_TOKEN: TOKEN,
+          TELEGRAM_CHANNEL_CHAT_ID: chatId,
+        } as NodeJS.ProcessEnv),
+      `${chatId} is a real channel name`,
+    );
+  }
+});
+
 // --- limits -------------------------------------------------------------------
 
 test('the size limits are per media type, and photos are far smaller', () => {
