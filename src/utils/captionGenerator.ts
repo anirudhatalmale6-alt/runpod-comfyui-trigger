@@ -36,6 +36,9 @@ export const CAPTION_LIMITS: Readonly<Record<PlatformId, CaptionLimit>> = Object
   facebook: { max: 2000, unit: "codeunit" },
   tiktok: { max: 2200, unit: "codeunit" },
   youtube: { max: 100, unit: "codeunit" },
+  // Reddit's is a post TITLE, not a caption, and 300 is a hard API limit — over
+  // it the submission comes back as a TOO_LONG error inside an HTTP 200.
+  reddit: { max: 300, unit: "codeunit" },
   fanvue: { max: 1000, unit: "codeunit" },
 });
 
@@ -109,6 +112,12 @@ export function styleFor(platform: PlatformId): string {
       return "Short, hooky, front-loaded. 2-4 trending-style hashtags.";
     case "youtube":
       return "A Shorts TITLE, not a caption. Under 100 characters, hooky, no hashtags.";
+    case "reddit":
+      return (
+        "A post TITLE, not a caption. Under 300 characters. Reddit punishes anything that " +
+        "reads like an advert, so: no hashtags, no emoji spam, no 'link in bio'. Write it " +
+        "the way a person posting to that community would write it."
+      );
     case "fanvue":
       return "Speaking to paying subscribers who already bought. Warm, no hard sell.";
     default:
@@ -116,10 +125,26 @@ export function styleFor(platform: PlatformId): string {
   }
 }
 
+/**
+ * Whether a promotional link belongs in the caption at all.
+ *
+ * Reddit is the exception and it is not a style preference: a post title
+ * carrying a promo URL reads as advertising, and the outcome is removal by the
+ * subreddit or a sitewide spam flag against the account. The traffic comes from
+ * the profile instead. Putting the link in anyway would be the kind of mistake
+ * that only shows up as posts quietly disappearing.
+ */
+export function acceptsLinkInCaption(platform: PlatformId): boolean {
+  return platform !== "reddit";
+}
+
 export function buildPrompt(context: CaptionContext): string {
   const intensity = context.intensity ?? "direct";
-  const cta =
-    intensity === "hard"
+  const linkAllowed = acceptsLinkInCaption(context.platform);
+
+  const cta = !linkAllowed
+    ? "Do NOT include any URL, and do not mention a link, a bio or subscribing. Write the title only."
+    : intensity === "hard"
       ? "End with a strong, explicit instruction to click the link and subscribe."
       : intensity === "soft"
         ? "End with a light, low-pressure mention of the link."
@@ -129,7 +154,7 @@ export function buildPrompt(context: CaptionContext): string {
     `Write a single caption for a post on ${PLATFORMS[context.platform]?.label ?? context.platform}.`,
     `Style: ${styleFor(context.platform)}`,
     context.description ? `About the image: ${context.description}` : "",
-    context.linkUrl ? `Link to drive traffic to: ${context.linkUrl}` : "",
+    context.linkUrl && linkAllowed ? `Link to drive traffic to: ${context.linkUrl}` : "",
     cta,
     "Return ONLY the caption text. No quotes, no preamble, no explanation, no alternatives.",
   ]

@@ -57,6 +57,11 @@ import {
   publishToInstagram,
 } from "../utils/metaClient.js";
 import { publishPhotoToTikTok, tiktokCredentialsFromEnv } from "../utils/tiktokClient.js";
+import {
+  publishToReddit,
+  redditCredentialsFromEnv,
+  subredditConfig,
+} from "../utils/redditClient.js";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { tigrisClient } from "../utils/storageClient.js";
 import { requireEnv } from "../utils/env.js";
@@ -161,7 +166,12 @@ export async function fetchForPlatform(
   // Telegram and Fanvue take the master: 10 MB and no format restriction.
   const prefersDerivative =
     asset.kind === "image" &&
-    (platform === "bluesky" || platform === "instagram" || platform === "tiktok");
+    (platform === "bluesky" ||
+      platform === "instagram" ||
+      platform === "tiktok" ||
+      // Reddit takes JPEG, PNG and GIF but NOT WebP, and the derivative is a
+      // smaller upload besides.
+      platform === "reddit");
 
   const candidates = prefersDerivative
     ? [webDerivativeKey(asset.key), asset.key]
@@ -184,6 +194,13 @@ export async function fetchForPlatform(
               `over Bluesky's ${MAX_BLOB_BYTES}-byte limit. Expected to find ` +
               `"${webDerivativeKey(asset.key)}". Have the ComfyUI workflow write the -web copy ` +
               `(1600px longest edge, JPEG q85) alongside the master.`,
+          );
+        }
+        if (platform === "reddit" && mimeType === "image/webp") {
+          throw new AbortTaskRunError(
+            `No web derivative for "${asset.key}" and the master is WebP, which Reddit does ` +
+              `not accept. PNG and JPEG are both fine here, so this only bites WebP masters. ` +
+              `Expected to find "${webDerivativeKey(asset.key)}".`,
           );
         }
         if ((platform === "instagram" || platform === "tiktok") && mimeType !== "image/jpeg") {
@@ -240,6 +257,14 @@ export interface PublishOnePayload {
    */
   text?: string;
   altText?: string;
+  /**
+   * Reddit only, and REQUIRED for it: which subreddit to post to.
+   *
+   * Only the NAME travels in the payload. Whether that sub accepts explicit
+   * material, and which flair it needs, come from the SUBREDDITS table in
+   * redditClient — a permission carried in a payload is not a permission.
+   */
+  subreddit?: string;
 }
 
 /**
@@ -294,7 +319,14 @@ export const publishOne = task({
     // this is the run that actually posts.
     assertPublishAllowed(payload.platform, asset);
 
-    const supported: PlatformId[] = ["bluesky", "telegram", "instagram", "facebook", "tiktok"];
+    const supported: PlatformId[] = [
+      "bluesky",
+      "telegram",
+      "instagram",
+      "facebook",
+      "tiktok",
+      "reddit",
+    ];
     if (!supported.includes(payload.platform)) {
       throw new AbortTaskRunError(
         `No adapter is built for ${payload.platform}. Live lanes: ${supported.join(", ")}. ` +
@@ -354,6 +386,36 @@ export const publishOne = task({
         publishId: result.publishId,
       });
       return { platform: payload.platform, id: result.publishId, url: "" };
+    }
+
+    if (payload.platform === "reddit") {
+      if (!payload.subreddit) {
+        throw new AbortTaskRunError(
+          `Reddit needs a subreddit. Add "subreddit": "<name>" to the payload — Reddit is not ` +
+            `one destination, it is a community with its own rules, so there is no default.`,
+        );
+      }
+      // Throws for anything not in the SUBREDDITS table, which is what stops a
+      // payload naming an arbitrary sub.
+      const subreddit = subredditConfig(payload.subreddit);
+
+      const result = await publishToReddit(redditCredentialsFromEnv(), {
+        subreddit,
+        // Reddit's is a TITLE, capped at 300, not a caption.
+        title: caption.slice(0, 300),
+        media: {
+          bytes: media.bytes,
+          mimeType: media.mimeType,
+          filename: media.key.split("/").pop() ?? "render.jpg",
+        },
+        asset,
+      });
+      logger.info(`Published to r/${subreddit.name}: ${result.url}`, {
+        id: result.id,
+        url: result.url,
+        subreddit: subreddit.name,
+      });
+      return { platform: payload.platform, id: result.id, url: result.url };
     }
 
     if (payload.platform === "telegram") {

@@ -32,6 +32,7 @@ const MODULES = [
   "src/utils/telegramClient.ts",
   "src/utils/metaClient.ts",
   "src/utils/tiktokClient.ts",
+  "src/utils/redditClient.ts",
   "src/trigger/publishPipeline.ts",
 ];
 

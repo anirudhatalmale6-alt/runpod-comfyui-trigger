@@ -43,6 +43,7 @@ export type PlatformId =
   | "telegram"
   | "tiktok"
   | "youtube"
+  | "reddit"
   | "fanvue";
 
 export interface Platform {
@@ -140,6 +141,25 @@ export const PLATFORMS: Readonly<Record<PlatformId, Platform>> = deepFreeze({
     media: ["video"],
     // ~1600 quota units per upload against a 10,000/day default.
     apiCeilingPerDay: 6,
+    adultPlatform: false,
+  },
+  reddit: {
+    id: "reddit",
+    label: "Reddit",
+    // DELIBERATELY SAFE-ONLY, and this is not an oversight.
+    //
+    // Reddit does permit explicit material, which is a large part of why the
+    // client wants the lane. But permission is a property of the SUBREDDIT, not
+    // of Reddit, and the same post is fine in one community and a ban in
+    // another. A single flag here cannot express that, and the value that would
+    // express it optimistically is the one that loses the account.
+    //
+    // So the platform gate stays closed and redditClient.ts carries a second,
+    // per-subreddit gate (assertSubredditAccepts) that has to be opened for a
+    // named sub. Widening this to ["safe", "explicit"] is a decision to make
+    // WITH the client, against a confirmed list of subs, not a default.
+    accepts: ["safe"],
+    media: ["image", "video"],
     adultPlatform: false,
   },
   fanvue: {

@@ -117,13 +117,24 @@ test('the platform table itself: no mainstream lane may ever accept explicit', (
   assert.ok(PLATFORMS.fanvue.accepts.includes('explicit'), 'fanvue is the explicit destination');
 });
 
-test('SOCIAL_PLATFORMS is the six mainstream lanes, and Fanvue is not one', () => {
+test('SOCIAL_PLATFORMS is the seven mainstream lanes, and Fanvue is not one', () => {
   assert.deepEqual(
     [...SOCIAL_PLATFORMS].sort(),
-    ['bluesky', 'facebook', 'instagram', 'telegram', 'tiktok', 'youtube'],
+    ['bluesky', 'facebook', 'instagram', 'reddit', 'telegram', 'tiktok', 'youtube'],
   );
   assert.ok(!SOCIAL_PLATFORMS.includes('fanvue'));
-  assert.equal(SOCIAL_PLATFORMS.length, 6);
+  assert.equal(SOCIAL_PLATFORMS.length, 7);
+});
+
+test('Reddit is safe-only at the PLATFORM level, whatever its communities allow', () => {
+  // Reddit does permit explicit material, and that is precisely the trap: it
+  // permits it in SOME communities. The platform-level flag cannot express
+  // "yes in r/a, no in r/b", so it stays closed and redditClient.ts gates per
+  // subreddit. If this ever reads ["safe", "explicit"], the per-sub gate has
+  // become the only thing standing between explicit content and a SFW sub.
+  assert.deepEqual([...PLATFORMS.reddit.accepts], ['safe']);
+  const decision = routeAsset({ key: 'explicit/a.jpg', kind: 'image' });
+  assert.ok(!decision.destinations.includes('reddit'));
 });
 
 test('Fansly is absent from the platform table entirely', () => {
