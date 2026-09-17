@@ -33,17 +33,26 @@ const MODULES = [
   "src/trigger/publishPipeline.ts",
 ];
 
-/** Imports that must survive, because they are genuinely external. */
-const KEEP = [
-  'import { ListObjectsV2Command, GetObjectCommand } from "@aws-sdk/client-s3";',
-  'import { logger, schedules, task, AbortTaskRunError } from "@trigger.dev/sdk/v3";',
-  'import { tigrisClient } from "../utils/storageClient.js";',
-  'import { requireEnv } from "../utils/env.js";',
-];
+/**
+ * Modules that are NOT inlined and whose imports must therefore survive.
+ *
+ * Matched by SPECIFIER, and the import statements themselves are collected from
+ * the sources rather than written out here. The previous version hard-coded the
+ * full import lines; the moment a source file added CopyObjectCommand to its
+ * @aws-sdk/client-s3 import, the bundler stripped the real statement and
+ * re-added the stale one, producing a file that referenced three commands it
+ * had never imported.
+ *
+ * That is the THIRD time a hand-written list in this package has gone quietly
+ * stale (install.sh's file list, then its scripts list). Deriving beats listing.
+ */
+const EXTERNAL = ["@aws-sdk/client-s3", "@trigger.dev/sdk/v3", "../utils/storageClient.js", "../utils/env.js"];
 
 const sections = [];
 /** Relative specifiers that were stripped, to be checked against MODULES. */
 const stripped_specifiers = new Set();
+/** Import statements for non-inlined modules, hoisted to the top verbatim. */
+const externalImports = new Set();
 
 for (const relative of MODULES) {
   const source = readFileSync(join(root, relative), "utf8");
@@ -53,7 +62,13 @@ for (const relative of MODULES) {
   const stripped = source.replace(
     /^import\s+(?:type\s+)?\{[\s\S]*?\}\s+from\s+["']([^"']+)["'];\s*$/gm,
     (match, specifier) => {
-      if (specifier.startsWith(".")) stripped_specifiers.add(specifier);
+      if (EXTERNAL.includes(specifier)) {
+        // Hoisted VERBATIM, so the bindings are always whatever the source
+        // actually imports today. Deduped by exact text.
+        externalImports.add(match.trim());
+      } else if (specifier.startsWith(".")) {
+        stripped_specifiers.add(specifier);
+      }
       return "";
     },
   );
@@ -96,7 +111,7 @@ const header = `/**
  * runs against. Edit the sources and rebuild, or the two will drift.
  */
 
-${KEEP.join("\n")}
+${[...externalImports].sort().join("\n")}
 `;
 
 let output = `${header}\n${sections.join("\n\n")}\n`;
@@ -158,14 +173,14 @@ writeFileSync(target, output);
     MODULES.map((m) => m.split("/").pop().replace(/\.ts$/, "")),
   );
   const orphans = [...stripped_specifiers].filter((specifier) => {
-    if (KEEP.some((k) => k.includes(`"${specifier}"`))) return false;
+    if (EXTERNAL.includes(specifier)) return false;
     const name = specifier.split("/").pop().replace(/\.(js|ts)$/, "");
     return !inlined.has(name);
   });
   if (orphans.length > 0) {
     console.error(
       `BUILD FAILED — these imports were stripped but never inlined:\n  ${orphans.join("\n  ")}\n` +
-        `Add the module to MODULES (in dependency order) or to KEEP. Leaving it out produces a ` +
+        `Add the module to MODULES (in dependency order) or to EXTERNAL. Leaving it out produces a ` +
         `bundle whose functions are undefined at runtime with no build error.`,
     );
     process.exit(1);
@@ -198,7 +213,7 @@ if (missing.length > 0) {
 const unexpected = output
   .split("\n")
   .filter((line) => /^import\b/.test(line) && /from\s+["']\./.test(line))
-  .filter((line) => !KEEP.includes(line.trim()));
+  .filter((line) => !externalImports.has(line.trim()));
 if (unexpected.length > 0) {
   console.error(`BUILD FAILED — unresolved relative import(s):\n${unexpected.join("\n")}`);
   process.exit(1);

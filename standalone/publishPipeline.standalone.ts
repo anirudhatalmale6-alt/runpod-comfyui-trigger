@@ -28,10 +28,16 @@
  * runs against. Edit the sources and rebuild, or the two will drift.
  */
 
-import { ListObjectsV2Command, GetObjectCommand } from "@aws-sdk/client-s3";
+import {
+  ListObjectsV2Command,
+  GetObjectCommand,
+  CopyObjectCommand,
+  HeadObjectCommand,
+  DeleteObjectCommand,
+} from "@aws-sdk/client-s3";
 import { logger, schedules, task, AbortTaskRunError } from "@trigger.dev/sdk/v3";
-import { tigrisClient } from "../utils/storageClient.js";
 import { requireEnv } from "../utils/env.js";
+import { tigrisClient } from "../utils/storageClient.js";
 
 // ==========================================================================
 // src/utils/contentRouting.ts
@@ -1854,6 +1860,95 @@ export const publishOne = task({
 
     logger.info(`Published to Bluesky: ${result.url}`, { uri: result.uri, url: result.url });
     return { platform: payload.platform, uri: result.uri, url: result.url };
+  },
+});
+
+/**
+ * Move an asset into a classified location, without touching the storage console.
+ *
+ * Exists because getting a file under a prefix through a web console turned out
+ * to be the single hardest step in this whole project for the person who has to
+ * do it. Trigger.dev already holds the storage credentials, so a task can do it
+ * with a button.
+ *
+ * IT NEVER CHOOSES THE CLASSIFICATION. The destination is supplied by a human
+ * and must already be under safe/ or explicit/. Auto-filing a stray render into
+ * safe/ would be exactly the unrecoverable mistake the routing rail exists to
+ * prevent — a machine guessing that something is publishable.
+ */
+export const copyAsset = task({
+  id: "copy-asset",
+  retry: { maxAttempts: 1 },
+  run: async (payload: { from: string; to: string; deleteOriginal?: boolean }) => {
+    const bucket = HOT_BUCKET();
+    const from = payload.from.replace(/^\/+/, "").trim();
+    const to = payload.to.replace(/^\/+/, "").trim();
+
+    if (from === "" || to === "") {
+      throw new AbortTaskRunError("Both `from` and `to` are required.");
+    }
+    if (from === to) {
+      throw new AbortTaskRunError("`from` and `to` are the same key — nothing to do.");
+    }
+
+    // The whole point of the guard: a destination nobody classified is not a
+    // destination. Refusing here keeps the invariant that everything in a
+    // publishable location was put there deliberately.
+    const contentClass = classifyFromKey(to);
+    if (contentClass === null) {
+      throw new AbortTaskRunError(
+        `Refusing to copy to "${to}": it is not under "safe/" or "explicit/". ` +
+          `Choose the classification yourself — this task will not guess it for you, ` +
+          `because guessing wrong is how explicit content reaches a public platform.`,
+      );
+    }
+
+    const source = await tigrisClient.send(
+      new HeadObjectCommand({ Bucket: bucket, Key: from }),
+    );
+
+    await tigrisClient.send(
+      new CopyObjectCommand({
+        Bucket: bucket,
+        // CopySource is bucket + key, and the key must be URI-encoded or any
+        // space or unusual character in the filename silently 404s.
+        CopySource: `${bucket}/${encodeURIComponent(from)}`,
+        Key: to,
+      }),
+    );
+
+    // Verify it actually landed and is the same size. A copy that "succeeded"
+    // and produced a zero-byte object would otherwise be reported as done.
+    const copied = await tigrisClient.send(
+      new HeadObjectCommand({ Bucket: bucket, Key: to }),
+    );
+    if (copied.ContentLength !== source.ContentLength) {
+      throw new Error(
+        `Copy verification failed: "${from}" is ${source.ContentLength} bytes but ` +
+          `"${to}" is ${copied.ContentLength}. The original has NOT been deleted.`,
+      );
+    }
+
+    let deleted = false;
+    if (payload.deleteOriginal === true) {
+      // Only after the copy is verified. A failed copy must never lose the file.
+      await tigrisClient.send(new DeleteObjectCommand({ Bucket: bucket, Key: from }));
+      deleted = true;
+    }
+
+    logger.info(`Copied ${from} -> ${to}`, {
+      bytes: copied.ContentLength,
+      contentClass,
+      originalDeleted: deleted,
+    });
+
+    return {
+      from,
+      to,
+      bytes: copied.ContentLength ?? 0,
+      contentClass,
+      originalDeleted: deleted,
+    };
   },
 });
 
