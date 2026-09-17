@@ -30,6 +30,8 @@ const MODULES = [
   "src/utils/publishScheduler.ts",
   "src/utils/blueskyClient.ts",
   "src/utils/telegramClient.ts",
+  "src/utils/metaClient.ts",
+  "src/utils/tiktokClient.ts",
   "src/trigger/publishPipeline.ts",
 ];
 
@@ -46,7 +48,13 @@ const MODULES = [
  * That is the THIRD time a hand-written list in this package has gone quietly
  * stale (install.sh's file list, then its scripts list). Deriving beats listing.
  */
-const EXTERNAL = ["@aws-sdk/client-s3", "@trigger.dev/sdk/v3", "../utils/storageClient.js", "../utils/env.js"];
+const EXTERNAL = [
+  "@aws-sdk/client-s3",
+  "@aws-sdk/s3-request-presigner",
+  "@trigger.dev/sdk/v3",
+  "../utils/storageClient.js",
+  "../utils/env.js",
+];
 
 const sections = [];
 /** Relative specifiers that were stripped, to be checked against MODULES. */
@@ -182,6 +190,39 @@ writeFileSync(target, output);
       `BUILD FAILED — these imports were stripped but never inlined:\n  ${orphans.join("\n  ")}\n` +
         `Add the module to MODULES (in dependency order) or to EXTERNAL. Leaving it out produces a ` +
         `bundle whose functions are undefined at runtime with no build error.`,
+    );
+    process.exit(1);
+  }
+}
+
+// No two inlined modules may export the same top-level NAME.
+//
+// `Fetcher` collided as a type alias and was collapsed because both
+// declarations were identical. `validateCaption` then collided as a FUNCTION,
+// where telegramClient takes (caption) and metaClient took
+// (caption, max, platform) — genuinely different behaviour behind one name.
+// Collapsing that would silently pick whichever came last in MODULES order.
+//
+// So functions and consts are never collapsed: the build fails and the name is
+// fixed at the source. Caught here rather than as a tsc error inside the
+// client's project, which is where the previous one surfaced.
+{
+  const declarations = new Map();
+  const collisions = [];
+  for (const match of output.matchAll(
+    /^export\s+(?:async\s+)?(?:function|const|class)\s+(\w+)/gm,
+  )) {
+    const name = match[1];
+    declarations.set(name, (declarations.get(name) ?? 0) + 1);
+  }
+  for (const [name, count] of declarations) {
+    if (count > 1) collisions.push(`${name} (declared ${count} times)`);
+  }
+  if (collisions.length > 0) {
+    console.error(
+      `BUILD FAILED — duplicate top-level export(s) across inlined modules:\n  ${collisions.join("\n  ")}\n` +
+        `Rename one at the source. These are not collapsed automatically because a shared name ` +
+        `with different behaviour would silently resolve to whichever module comes last.`,
     );
     process.exit(1);
   }

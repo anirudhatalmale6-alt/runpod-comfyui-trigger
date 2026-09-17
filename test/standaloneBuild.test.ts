@@ -59,11 +59,17 @@ test('the bundle needs no dependency the project does not already have', () => {
     '../utils/env.js',
     '../utils/storageClient.js',
     '@aws-sdk/client-s3',
+    '@aws-sdk/s3-request-presigner',
     '@trigger.dev/sdk/v3',
   ]);
-  // The whole point of the standalone build: no npm install step.
+
+  // The presigner became REQUIRED when the Meta lanes landed: Instagram and
+  // Facebook do not accept bytes, they fetch the media from a URL we supply,
+  // and the bucket is private. This test previously asserted the OPPOSITE --
+  // that the publish path needed no presigner -- which was true right up until
+  // it wasn't. Leaving it would have been a green test asserting a stale fact.
   assert.ok(
-    !bundle.includes('@aws-sdk/s3-request-presigner'),
-    'the presigner belongs to the Fanvue delivery path, not the publish path',
+    bundle.includes('getSignedUrl'),
+    'Instagram and Facebook need presigned URLs; the bundle must import the presigner',
   );
 });

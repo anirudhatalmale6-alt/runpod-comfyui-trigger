@@ -27,6 +27,7 @@ import {
 import { logger, schedules, task, AbortTaskRunError } from "@trigger.dev/sdk/v3";
 
 import {
+  PLATFORMS,
   assertPublishAllowed,
   routeAsset,
   type AssetRef,
@@ -49,6 +50,14 @@ import {
   telegramCredentialsFromEnv,
 } from "../utils/telegramClient.js";
 import { generateCaption, fallbackCaption } from "../utils/captionGenerator.js";
+import {
+  facebookCredentialsFromEnv,
+  instagramCredentialsFromEnv,
+  publishToFacebook,
+  publishToInstagram,
+} from "../utils/metaClient.js";
+import { publishPhotoToTikTok, tiktokCredentialsFromEnv } from "../utils/tiktokClient.js";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { tigrisClient } from "../utils/storageClient.js";
 import { requireEnv } from "../utils/env.js";
 
@@ -145,7 +154,14 @@ export async function fetchForPlatform(
   platform: PlatformId,
 ): Promise<{ bytes: Uint8Array; mimeType: string; key: string }> {
   const bucket = HOT_BUCKET();
-  const prefersDerivative = platform === "bluesky" && asset.kind === "image";
+  // THREE lanes want the -web.jpg derivative, for two different reasons:
+  //   bluesky    the master is usually over its 1,000,000-byte blob limit
+  //   instagram  JPEG is the ONLY image format Instagram accepts
+  //   tiktok     photo posts are JPEG only as well
+  // Telegram and Fanvue take the master: 10 MB and no format restriction.
+  const prefersDerivative =
+    asset.kind === "image" &&
+    (platform === "bluesky" || platform === "instagram" || platform === "tiktok");
 
   const candidates = prefersDerivative
     ? [webDerivativeKey(asset.key), asset.key]
@@ -160,13 +176,24 @@ export async function fetchForPlatform(
       const bytes = await bodyToBytes(object.Body);
       const mimeType = object.ContentType ?? mimeTypeFromKey(key) ?? "application/octet-stream";
 
-      if (prefersDerivative && key === asset.key && bytes.byteLength > MAX_BLOB_BYTES) {
-        throw new AbortTaskRunError(
-          `No web derivative for "${asset.key}" and the master is ${bytes.byteLength} bytes, ` +
-            `over Bluesky's ${MAX_BLOB_BYTES}-byte limit. Expected to find ` +
-            `"${webDerivativeKey(asset.key)}". Have the ComfyUI workflow write the -web copy ` +
-            `(1600px longest edge, JPEG q85) alongside the master.`,
-        );
+      if (prefersDerivative && key === asset.key) {
+        // Fell back to the master. Whether that is fatal depends on the lane.
+        if (platform === "bluesky" && bytes.byteLength > MAX_BLOB_BYTES) {
+          throw new AbortTaskRunError(
+            `No web derivative for "${asset.key}" and the master is ${bytes.byteLength} bytes, ` +
+              `over Bluesky's ${MAX_BLOB_BYTES}-byte limit. Expected to find ` +
+              `"${webDerivativeKey(asset.key)}". Have the ComfyUI workflow write the -web copy ` +
+              `(1600px longest edge, JPEG q85) alongside the master.`,
+          );
+        }
+        if ((platform === "instagram" || platform === "tiktok") && mimeType !== "image/jpeg") {
+          throw new AbortTaskRunError(
+            `No web derivative for "${asset.key}" and the master is ${mimeType}. ` +
+              `${PLATFORMS[platform].label} accepts JPEG only — this is a FORMAT limit, not a ` +
+              `size one, so a smaller PNG would not help either. Expected to find ` +
+              `"${webDerivativeKey(asset.key)}". Have the ComfyUI workflow write the -web copy.`,
+          );
+        }
       }
       return { bytes, mimeType, key };
     } catch (error) {
@@ -176,6 +203,28 @@ export async function fetchForPlatform(
   }
   throw new Error(
     `Could not read any of [${candidates.join(", ")}] from "${bucket}": ${String(lastError)}`,
+  );
+}
+
+/**
+ * A short-lived public link to an object, for the lanes that fetch rather than
+ * receive.
+ *
+ * Instagram and Facebook do not accept bytes — Meta's servers download the
+ * media from a URL you supply. The bucket is private, so that URL has to be
+ * presigned.
+ *
+ * The expiry is deliberately generous. Meta fetches the image during container
+ * processing, which can take a while under load, and a link that expires
+ * mid-fetch surfaces as "media download failed" with nothing pointing at the
+ * expiry. Thirty minutes costs nothing: the link is unguessable, it is for a
+ * file that is about to be posted publicly anyway, and it dies on its own.
+ */
+export async function presignedUrlFor(key: string, expiresInSeconds = 1800): Promise<string> {
+  return getSignedUrl(
+    tigrisClient,
+    new GetObjectCommand({ Bucket: HOT_BUCKET(), Key: key }),
+    { expiresIn: expiresInSeconds },
   );
 }
 
@@ -245,10 +294,11 @@ export const publishOne = task({
     // this is the run that actually posts.
     assertPublishAllowed(payload.platform, asset);
 
-    if (payload.platform !== "bluesky" && payload.platform !== "telegram") {
+    const supported: PlatformId[] = ["bluesky", "telegram", "instagram", "facebook", "tiktok"];
+    if (!supported.includes(payload.platform)) {
       throw new AbortTaskRunError(
-        `No adapter is built for ${payload.platform} yet. Bluesky and Telegram are live; ` +
-          `Instagram, Facebook, TikTok and YouTube are waiting on app review.`,
+        `No adapter is built for ${payload.platform}. Live lanes: ${supported.join(", ")}. ` +
+          `(YouTube was dropped from the plan.)`,
       );
     }
 
@@ -262,6 +312,49 @@ export const publishOne = task({
       bytes: media.bytes.byteLength,
       usedWebDerivative: media.key !== asset.key,
     });
+
+    if (payload.platform === "instagram" || payload.platform === "facebook") {
+      // Meta fetches the file itself, so it gets a link rather than the bytes.
+      // media.key is already the -web.jpg derivative where one exists.
+      const imageUrl = await presignedUrlFor(media.key);
+      const result =
+        payload.platform === "instagram"
+          ? await publishToInstagram(instagramCredentialsFromEnv(), {
+              imageUrl,
+              caption,
+              asset,
+              mimeType: media.mimeType,
+            })
+          : await publishToFacebook(facebookCredentialsFromEnv(), {
+              imageUrl,
+              caption,
+              asset,
+            });
+      logger.info(`Published to ${PLATFORMS[payload.platform].label}: ${result.url}`, {
+        id: result.id,
+        url: result.url,
+        // Never log the signed URL itself: it is a working credential for the
+        // life of its expiry.
+        sourceKey: media.key,
+      });
+      return { platform: payload.platform, id: result.id, url: result.url };
+    }
+
+    if (payload.platform === "tiktok") {
+      const result = await publishPhotoToTikTok(tiktokCredentialsFromEnv(), {
+        bytes: media.bytes,
+        mimeType: media.mimeType,
+        // TikTok's title is a short hook capped at 90 characters, so the
+        // caption is trimmed rather than sent whole.
+        title: caption.slice(0, 90),
+        description: caption,
+        asset,
+      });
+      logger.info(`Published to TikTok, publish id ${result.publishId}`, {
+        publishId: result.publishId,
+      });
+      return { platform: payload.platform, id: result.publishId, url: "" };
+    }
 
     if (payload.platform === "telegram") {
       // Telegram's photo ceiling is 10 MB against Bluesky's 1,000,000 bytes, so
@@ -442,7 +535,10 @@ export const publishPlanner = schedules.task({
     for (const post of plan.scheduled) {
       // Only lanes with a working adapter are dispatched. The rest are planned
       // and reported so the schedule is visible before the adapters exist.
-      if (post.platform !== "bluesky" && post.platform !== "telegram") {
+      const dispatchable: PlatformId[] = [
+        "bluesky", "telegram", "instagram", "facebook", "tiktok",
+      ];
+      if (!dispatchable.includes(post.platform)) {
         logger.info(`Planned (no adapter yet): ${post.platform} ${post.asset.key}`, {
           scheduledFor: post.scheduledFor.toISOString(),
         });

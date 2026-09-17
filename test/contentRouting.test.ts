@@ -225,7 +225,11 @@ test('the daily limit is the stricter of the cadence and the API ceiling', () =>
   // leaves nothing for metadata calls or the retry of a failed upload.
   assert.equal(dailyLimitFor('youtube', 'video'), 4);
   // Raising the cadence past a ceiling must clamp, not exceed it.
-  assert.equal(dailyLimitFor('instagram', 'image', { maxPostsPerDay: 100, maxVideosPerDay: 100 }), 25);
+  // Instagram's documented ceiling is 100 API-published posts per 24h, so a
+  // cadence of 100 is not clamped. (This asserted 25 until the official docs
+  // were checked; the old figure was from an outdated source.)
+  assert.equal(dailyLimitFor('instagram', 'image', { maxPostsPerDay: 100, maxVideosPerDay: 100 }), 100);
+  assert.equal(dailyLimitFor('instagram', 'image', { maxPostsPerDay: 250, maxVideosPerDay: 250 }), 100);
   assert.equal(dailyLimitFor('youtube', 'video', { maxPostsPerDay: 100, maxVideosPerDay: 100 }), 6);
   // No documented ceiling does not mean unlimited — the cadence still applies.
   assert.equal(dailyLimitFor('bluesky', 'image', { maxPostsPerDay: 4, maxVideosPerDay: 1 }), 4);

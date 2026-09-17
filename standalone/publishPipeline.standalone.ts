@@ -35,6 +35,7 @@ import {
   HeadObjectCommand,
   DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { logger, schedules, task, AbortTaskRunError } from "@trigger.dev/sdk/v3";
 import { requireEnv } from "../utils/env.js";
 import { tigrisClient } from "../utils/storageClient.js";
@@ -144,8 +145,10 @@ export const PLATFORMS: Readonly<Record<PlatformId, Platform>> = deepFreeze({
     label: "Instagram",
     accepts: ["safe"],
     media: ["image", "video"],
-    // Content Publishing API: 25 published posts per rolling 24 hours.
-    apiCeilingPerDay: 25,
+    // Content Publishing API: 100 API-published posts per rolling 24 hours.
+    // (I previously recorded 25 here from an older figure — the current docs
+    // say 100. Corrected rather than left to be discovered by a wrong refusal.)
+    apiCeilingPerDay: 100,
     adultPlatform: false,
   },
   facebook: {
@@ -1575,6 +1578,555 @@ export async function publishToTelegram(
 }
 
 // ==========================================================================
+// src/utils/metaClient.ts
+// ==========================================================================
+
+/**
+ * Instagram and Facebook, both via the Meta Graph API.
+ *
+ * THESE TWO DO NOT TAKE BYTES. Meta's servers fetch the media themselves from a
+ * URL you hand them, so the caller must supply a publicly reachable link rather
+ * than a buffer. The renders live in a private bucket, so that link is a
+ * short-lived presigned URL. It is the only lane in this project that works
+ * that way, and getting it wrong reads as "the image failed to download" with
+ * no indication of why.
+ *
+ * ⚠️ INSTAGRAM ACCEPTS JPEG ONLY. Not PNG, not WebP — "JPEG is the only image
+ * format supported", per Meta's own documentation. The pipeline already writes
+ * a `-web.jpg` derivative for Bluesky's size limit; Instagram needs that same
+ * derivative for a completely different reason. A PNG master sent here fails
+ * at Meta's end, after the container call has already succeeded.
+ *
+ * Instagram is a TWO-STEP publish: create a container, then publish it. The
+ * container can still be processing when the first call returns, which is why
+ * publishing is retried against its status rather than fired once and hoped for.
+ */
+
+
+export const GRAPH_API = "https://graph.facebook.com";
+export const GRAPH_VERSION = "v21.0";
+
+/** Instagram: "JPEG is the only image format supported." */
+export const INSTAGRAM_IMAGE_TYPES: readonly string[] = Object.freeze(["image/jpeg"]);
+
+/** Instagram caption limit. */
+export const INSTAGRAM_MAX_CAPTION = 2200;
+/** Facebook caption limit, conservatively below the documented maximum. */
+export const FACEBOOK_MAX_CAPTION = 2000;
+
+
+export interface MetaOptions {
+  fetch?: Fetcher;
+  api?: string;
+  version?: string;
+  /** Injected in tests so container polling does not actually sleep. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+export interface InstagramCredentials {
+  /** The Instagram professional account id (not the Facebook page id). */
+  igUserId: string;
+  accessToken: string;
+}
+
+export interface FacebookCredentials {
+  pageId: string;
+  /** A PAGE access token, not a user token. */
+  pageAccessToken: string;
+}
+
+function requireVars(env: NodeJS.ProcessEnv, names: string[]): Record<string, string> {
+  const found: Record<string, string> = {};
+  const missing: string[] = [];
+  for (const name of names) {
+    const value = (env[name] ?? "").trim();
+    if (value === "") missing.push(name);
+    else found[name] = value;
+  }
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing environment variable(s): ${missing.join(", ")}. ` +
+        `Trigger.dev variables are per-environment — set in Development is not set in Production.`,
+    );
+  }
+  return found;
+}
+
+export function instagramCredentialsFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): InstagramCredentials {
+  const vars = requireVars(env, ["INSTAGRAM_USER_ID", "INSTAGRAM_ACCESS_TOKEN"]);
+  // A numeric-looking id is expected. A Facebook PAGE id pasted here instead of
+  // the Instagram account id is the classic mix-up, and it fails as a confusing
+  // permissions error rather than "wrong id", so say so up front.
+  if (!/^\d+$/.test(vars.INSTAGRAM_USER_ID!)) {
+    throw new Error(
+      `INSTAGRAM_USER_ID should be the numeric Instagram professional account id. ` +
+        `Got "${vars.INSTAGRAM_USER_ID}". Note this is NOT your @handle and NOT the ` +
+        `Facebook page id — mixing those up surfaces as a permissions error, not a bad id.`,
+    );
+  }
+  return { igUserId: vars.INSTAGRAM_USER_ID!, accessToken: vars.INSTAGRAM_ACCESS_TOKEN! };
+}
+
+export function facebookCredentialsFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): FacebookCredentials {
+  const vars = requireVars(env, ["FACEBOOK_PAGE_ID", "FACEBOOK_PAGE_ACCESS_TOKEN"]);
+  if (!/^\d+$/.test(vars.FACEBOOK_PAGE_ID!)) {
+    throw new Error(
+      `FACEBOOK_PAGE_ID should be the numeric page id. Got "${vars.FACEBOOK_PAGE_ID}".`,
+    );
+  }
+  return {
+    pageId: vars.FACEBOOK_PAGE_ID!,
+    pageAccessToken: vars.FACEBOOK_PAGE_ACCESS_TOKEN!,
+  };
+}
+
+/**
+ * Turn a Graph API failure into something actionable.
+ *
+ * Never includes the access token. Meta's own error text is often generic
+ * ("Unsupported post request"), so the common causes are spelled out instead of
+ * passed through — each of these cost somebody an afternoon at some point.
+ */
+export function describeMetaError(
+  method: string,
+  status: number,
+  body: { error?: { message?: string; code?: number; error_subcode?: number; type?: string } },
+): string {
+  const error = body.error ?? {};
+  const base =
+    `Meta ${method} failed: HTTP ${status}` +
+    (error.message ? ` — ${error.message}` : "") +
+    (error.code !== undefined ? ` (code ${error.code}` : "") +
+    (error.error_subcode !== undefined ? `/${error.error_subcode})` : error.code !== undefined ? ")" : "");
+
+  if (error.code === 190) {
+    return `${base}. The access token is invalid or expired. Page tokens derived from a ` +
+      `short-lived user token expire in about an hour — you want a long-lived one.`;
+  }
+  if (error.code === 200 || error.code === 10) {
+    return `${base}. This is a PERMISSIONS problem, not a bad request. Instagram publishing ` +
+      `needs instagram_business_content_publish; Facebook page posting needs ` +
+      `pages_manage_posts. Both require app review and business verification.`;
+  }
+  if (error.code === 4 || error.code === 17 || error.code === 32) {
+    return `${base}. Rate limited by Meta. The scheduler paces posts, so this suggests ` +
+      `something is retrying in a loop.`;
+  }
+  if (error.code === 9004 || /media.*(download|fetch|retriev)/i.test(error.message ?? "")) {
+    return `${base}. Meta could not DOWNLOAD the media from the URL we gave it. The link is ` +
+      `presigned and short-lived — if it expired before Meta fetched it, raise the expiry. ` +
+      `Also check the file is genuinely reachable and is a JPEG.`;
+  }
+  return base;
+}
+
+async function graphPost(
+  fetcher: Fetcher,
+  url: string,
+  params: Record<string, string>,
+  method: string,
+): Promise<Record<string, unknown>> {
+  const form = new URLSearchParams(params);
+  const response = await fetcher(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: form.toString(),
+  });
+
+  let payload: Record<string, unknown> = {};
+  try {
+    payload = (await response.json()) as Record<string, unknown>;
+  } catch {
+    /* fall through to a status-only message */
+  }
+
+  if (!response.ok || payload.error) {
+    throw new Error(describeMetaError(method, response.status, payload as never));
+  }
+  return payload;
+}
+
+export function validateMetaCaption(caption: string, max: number, platform: string): string[] {
+  if (caption.length > max) {
+    return [`caption is ${caption.length} characters, over ${platform}'s ${max} limit`];
+  }
+  return [];
+}
+
+export interface MetaPostResult {
+  /** The published post or photo id. */
+  id: string;
+  /** Browsable link where one can be derived; empty otherwise. */
+  url: string;
+}
+
+export interface InstagramPostRequest {
+  /** PUBLICLY REACHABLE url — Meta fetches this itself. Must be a JPEG. */
+  imageUrl: string;
+  caption: string;
+  asset?: AssetRef;
+  /** Set when the caller knows the source content type, for the JPEG check. */
+  mimeType?: string;
+}
+
+/**
+ * Publish a single image to Instagram.
+ *
+ * Two steps, and the gap between them is real: a container can be PUBLISHED,
+ * IN_PROGRESS, ERROR or EXPIRED. Publishing an IN_PROGRESS container fails, so
+ * the status is polled briefly rather than assumed ready.
+ */
+export async function publishToInstagram(
+  credentials: InstagramCredentials,
+  request: InstagramPostRequest,
+  options: MetaOptions = {},
+): Promise<MetaPostResult> {
+  const fetcher = options.fetch ?? fetch;
+  const api = options.api ?? GRAPH_API;
+  const version = options.version ?? GRAPH_VERSION;
+  const sleep = options.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+
+  if (request.asset) assertPublishAllowed("instagram", request.asset);
+
+  // Caught here rather than by Meta, because Meta's failure for a PNG arrives
+  // AFTER the container call has already returned an id, which reads as a
+  // publish bug rather than a format problem.
+  if (request.mimeType && !INSTAGRAM_IMAGE_TYPES.includes(request.mimeType)) {
+    throw new Error(
+      `Refusing to publish to Instagram: JPEG is the only image format Instagram accepts, ` +
+        `and this is ${request.mimeType}. Use the -web.jpg derivative rather than the master.`,
+    );
+  }
+
+  const problems = validateMetaCaption(request.caption, INSTAGRAM_MAX_CAPTION, "Instagram");
+  if (problems.length > 0) {
+    throw new Error(`Refusing to publish to Instagram: ${problems.join("; ")}`);
+  }
+
+  const container = await graphPost(
+    fetcher,
+    `${api}/${version}/${credentials.igUserId}/media`,
+    {
+      image_url: request.imageUrl,
+      caption: request.caption,
+      access_token: credentials.accessToken,
+    },
+    "create media container",
+  );
+
+  const creationId = String(container.id ?? "");
+  if (creationId === "") {
+    throw new Error("Instagram container creation returned no id.");
+  }
+
+  // Poll briefly. Meta fetches the image during this window, so the wait is
+  // doing real work rather than being superstition.
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const statusResponse = await fetcher(
+      `${api}/${version}/${creationId}?fields=status_code,status&access_token=${encodeURIComponent(credentials.accessToken)}`,
+    );
+    const status = (await statusResponse.json().catch(() => ({}))) as {
+      status_code?: string;
+      status?: string;
+      error?: unknown;
+    };
+
+    if (status.status_code === "FINISHED" || status.status_code === undefined) break;
+    if (status.status_code === "ERROR" || status.status_code === "EXPIRED") {
+      throw new Error(
+        `Instagram container ${creationId} is ${status.status_code}: ${status.status ?? "no detail"}. ` +
+          `This almost always means Meta could not download or could not accept the image.`,
+      );
+    }
+    await sleep(2000);
+  }
+
+  const published = await graphPost(
+    fetcher,
+    `${api}/${version}/${credentials.igUserId}/media_publish`,
+    { creation_id: creationId, access_token: credentials.accessToken },
+    "publish media",
+  );
+
+  const id = String(published.id ?? "");
+  if (id === "") throw new Error("Instagram media_publish returned no id.");
+  return { id, url: `https://www.instagram.com/p/${id}` };
+}
+
+export interface FacebookPostRequest {
+  /** PUBLICLY REACHABLE url — Meta fetches this itself. */
+  imageUrl: string;
+  caption: string;
+  asset?: AssetRef;
+}
+
+/** Publish a single photo to a Facebook Page. One step, unlike Instagram. */
+export async function publishToFacebook(
+  credentials: FacebookCredentials,
+  request: FacebookPostRequest,
+  options: MetaOptions = {},
+): Promise<MetaPostResult> {
+  const fetcher = options.fetch ?? fetch;
+  const api = options.api ?? GRAPH_API;
+  const version = options.version ?? GRAPH_VERSION;
+
+  if (request.asset) assertPublishAllowed("facebook", request.asset);
+
+  const problems = validateMetaCaption(request.caption, FACEBOOK_MAX_CAPTION, "Facebook");
+  if (problems.length > 0) {
+    throw new Error(`Refusing to publish to Facebook: ${problems.join("; ")}`);
+  }
+
+  const result = await graphPost(
+    fetcher,
+    `${api}/${version}/${credentials.pageId}/photos`,
+    {
+      url: request.imageUrl,
+      caption: request.caption,
+      published: "true",
+      access_token: credentials.pageAccessToken,
+    },
+    "publish page photo",
+  );
+
+  // The endpoint returns both a photo id and a post id; the post id is the one
+  // that corresponds to something a human can open.
+  const postId = String(result.post_id ?? result.id ?? "");
+  if (postId === "") throw new Error("Facebook photo post returned no id.");
+  return { id: postId, url: `https://www.facebook.com/${postId}` };
+}
+
+// ==========================================================================
+// src/utils/tiktokClient.ts
+// ==========================================================================
+
+/**
+ * TikTok Content Posting API.
+ *
+ * TikTok offers two ways to hand over media:
+ *
+ *   PULL_FROM_URL   TikTok downloads it from your URL — but ONLY from a domain
+ *                   you have verified ownership of in the developer portal.
+ *   FILE_UPLOAD     TikTok gives you an upload URL and you PUT the bytes.
+ *
+ * This uses FILE_UPLOAD, deliberately. The renders sit on Tigris's domain, not
+ * the client's, so domain verification is impossible — the verification widget
+ * requires proving you own the host. PULL_FROM_URL would fail every time with
+ * an "unverified URL" error that reads like a bad link rather than a policy.
+ *
+ * So the three lanes now move media three different ways: Bluesky and Telegram
+ * take raw bytes directly, Instagram and Facebook are handed a link they fetch
+ * themselves, and TikTok takes bytes but to a URL it nominates.
+ *
+ * Photo posts use /v2/post/publish/content/init/ with media_type PHOTO; videos
+ * use /v2/post/publish/video/init/. Both then need the upload step.
+ */
+
+
+export const TIKTOK_API = "https://open.tiktokapis.com";
+
+/** Photo posts: 1-10 images, JPG/JPEG, each under 20 MB. */
+export const TIKTOK_MAX_PHOTO_BYTES = 20 * 1024 * 1024;
+export const TIKTOK_PHOTO_TYPES: readonly string[] = Object.freeze(["image/jpeg"]);
+/** Title limit for a post. */
+export const TIKTOK_MAX_TITLE = 90;
+/** Description limit. */
+export const TIKTOK_MAX_DESCRIPTION = 4000;
+
+
+export interface TikTokOptions {
+  fetch?: Fetcher;
+  api?: string;
+}
+
+export interface TikTokCredentials {
+  /** A user access token with video.publish scope. */
+  accessToken: string;
+}
+
+export function tiktokCredentialsFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): TikTokCredentials {
+  const accessToken = (env.TIKTOK_ACCESS_TOKEN ?? "").trim();
+  if (accessToken === "") {
+    throw new Error(
+      "Cannot publish to TikTok: TIKTOK_ACCESS_TOKEN is not set. " +
+        "Trigger.dev variables are per-environment — set in Development is not set in Production.",
+    );
+  }
+  return { accessToken };
+}
+
+/**
+ * Turn a TikTok API failure into something actionable.
+ *
+ * Never includes the access token. TikTok's error codes are specific and worth
+ * translating, because several of them are approval-state problems that read
+ * like code faults.
+ */
+export function describeTikTokError(
+  step: string,
+  status: number,
+  errorCode: string,
+  message: string,
+): string {
+  const base = `TikTok ${step} failed: HTTP ${status}${errorCode ? ` — ${errorCode}` : ""}${message ? `: ${message}` : ""}`;
+
+  if (/unaudited_client|spam_risk|unaudited/i.test(errorCode)) {
+    return `${base}. The app has not passed TikTok's content-posting audit, so it can only ` +
+      `post PRIVATELY to your own account. Public posting needs the audited scope.`;
+  }
+  if (/url_ownership_unverified/i.test(errorCode)) {
+    return `${base}. This is the PULL_FROM_URL domain-verification error. We use FILE_UPLOAD ` +
+      `precisely to avoid it, so seeing this means something switched the transfer mode.`;
+  }
+  if (/access_token_invalid|scope_not_authorized/i.test(errorCode)) {
+    return `${base}. The token is invalid or lacks the video.publish scope.`;
+  }
+  if (/rate_limit/i.test(errorCode)) {
+    return `${base}. Rate limited. The scheduler paces posts, so this suggests a retry loop.`;
+  }
+  if (/file_format_check_failed|picture_size_check_failed/i.test(errorCode)) {
+    return `${base}. TikTok rejected the file itself. Photos must be JPEG and under 20 MB — ` +
+      `use the -web.jpg derivative rather than a PNG master.`;
+  }
+  return base;
+}
+
+interface InitResponse {
+  data?: {
+    publish_id?: string;
+    upload_url?: string;
+  };
+  error?: { code?: string; message?: string };
+}
+
+export interface TikTokPostRequest {
+  bytes: Uint8Array;
+  mimeType: string;
+  /** Short hook, shown as the post title. */
+  title: string;
+  description?: string;
+  asset?: AssetRef;
+  /**
+   * SELF_ONLY keeps the post private. Default is PUBLIC_TO_EVERYONE, but an
+   * unaudited app is forced to SELF_ONLY by TikTok regardless of what is asked.
+   */
+  privacyLevel?: "PUBLIC_TO_EVERYONE" | "MUTUAL_FOLLOW_FRIENDS" | "SELF_ONLY";
+}
+
+export function validatePhoto(bytes: Uint8Array, mimeType: string): string[] {
+  const problems: string[] = [];
+  if (!TIKTOK_PHOTO_TYPES.includes(mimeType)) {
+    problems.push(`TikTok photo posts accept JPEG only, not ${mimeType}`);
+  }
+  if (bytes.byteLength === 0) problems.push("media is zero bytes");
+  if (bytes.byteLength > TIKTOK_MAX_PHOTO_BYTES) {
+    problems.push(
+      `photo is ${bytes.byteLength} bytes, over TikTok's ${TIKTOK_MAX_PHOTO_BYTES}-byte limit`,
+    );
+  }
+  return problems;
+}
+
+export function validateTitle(title: string): string[] {
+  if (title.length > TIKTOK_MAX_TITLE) {
+    return [`title is ${title.length} characters, over TikTok's ${TIKTOK_MAX_TITLE} limit`];
+  }
+  return [];
+}
+
+export interface TikTokPostResult {
+  publishId: string;
+}
+
+/**
+ * Publish a photo post.
+ *
+ * Init, then PUT the bytes to the URL TikTok nominates. The PUT must carry a
+ * Content-Range header covering the whole file even for a single-chunk upload —
+ * omitting it fails in a way that does not mention ranges.
+ */
+export async function publishPhotoToTikTok(
+  credentials: TikTokCredentials,
+  request: TikTokPostRequest,
+  options: TikTokOptions = {},
+): Promise<TikTokPostResult> {
+  const fetcher = options.fetch ?? fetch;
+  const api = options.api ?? TIKTOK_API;
+
+  if (request.asset) assertPublishAllowed("tiktok", request.asset);
+
+  const problems = [
+    ...validatePhoto(request.bytes, request.mimeType),
+    ...validateTitle(request.title),
+  ];
+  if (problems.length > 0) {
+    throw new Error(`Refusing to publish to TikTok: ${problems.join("; ")}`);
+  }
+
+  const initResponse = await fetcher(`${api}/v2/post/publish/content/init/`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${credentials.accessToken}`,
+      "Content-Type": "application/json; charset=UTF-8",
+    },
+    body: JSON.stringify({
+      media_type: "PHOTO",
+      post_mode: "DIRECT_POST",
+      post_info: {
+        title: request.title,
+        description: request.description ?? request.title,
+        privacy_level: request.privacyLevel ?? "PUBLIC_TO_EVERYONE",
+      },
+      source_info: {
+        source: "FILE_UPLOAD",
+        photo_cover_index: 0,
+        photo_images: [{ image_size: request.bytes.byteLength }],
+      },
+    }),
+  });
+
+  const init = (await initResponse.json().catch(() => ({}))) as InitResponse;
+  if (!initResponse.ok || (init.error?.code && init.error.code !== "ok")) {
+    throw new Error(
+      describeTikTokError("init", initResponse.status, init.error?.code ?? "", init.error?.message ?? ""),
+    );
+  }
+
+  const publishId = init.data?.publish_id ?? "";
+  const uploadUrl = init.data?.upload_url ?? "";
+  if (publishId === "" || uploadUrl === "") {
+    throw new Error("TikTok init returned no publish_id or upload_url.");
+  }
+
+  const total = request.bytes.byteLength;
+  const upload = await fetcher(uploadUrl, {
+    method: "PUT",
+    headers: {
+      "Content-Type": request.mimeType,
+      // Required even for a single chunk. Without it the upload fails with an
+      // error that says nothing about ranges.
+      "Content-Range": `bytes 0-${total - 1}/${total}`,
+    },
+    body: new Blob([Buffer.from(request.bytes)], { type: request.mimeType }),
+  });
+
+  if (!upload.ok) {
+    throw new Error(
+      `TikTok media upload failed: HTTP ${upload.status}. The post was initialised ` +
+        `(publish_id ${publishId}) but the bytes did not transfer, so nothing was published.`,
+    );
+  }
+
+  return { publishId };
+}
+
+// ==========================================================================
 // src/trigger/publishPipeline.ts
 // ==========================================================================
 
@@ -1596,6 +2148,9 @@ export async function publishToTelegram(
  * The planner is therefore safe to run as often as you like. Running it twice
  * is a no-op, not a second set of posts.
  */
+
+
+
 
 
 
@@ -1699,7 +2254,14 @@ export async function fetchForPlatform(
   platform: PlatformId,
 ): Promise<{ bytes: Uint8Array; mimeType: string; key: string }> {
   const bucket = HOT_BUCKET();
-  const prefersDerivative = platform === "bluesky" && asset.kind === "image";
+  // THREE lanes want the -web.jpg derivative, for two different reasons:
+  //   bluesky    the master is usually over its 1,000,000-byte blob limit
+  //   instagram  JPEG is the ONLY image format Instagram accepts
+  //   tiktok     photo posts are JPEG only as well
+  // Telegram and Fanvue take the master: 10 MB and no format restriction.
+  const prefersDerivative =
+    asset.kind === "image" &&
+    (platform === "bluesky" || platform === "instagram" || platform === "tiktok");
 
   const candidates = prefersDerivative
     ? [webDerivativeKey(asset.key), asset.key]
@@ -1714,13 +2276,24 @@ export async function fetchForPlatform(
       const bytes = await bodyToBytes(object.Body);
       const mimeType = object.ContentType ?? mimeTypeFromKey(key) ?? "application/octet-stream";
 
-      if (prefersDerivative && key === asset.key && bytes.byteLength > MAX_BLOB_BYTES) {
-        throw new AbortTaskRunError(
-          `No web derivative for "${asset.key}" and the master is ${bytes.byteLength} bytes, ` +
-            `over Bluesky's ${MAX_BLOB_BYTES}-byte limit. Expected to find ` +
-            `"${webDerivativeKey(asset.key)}". Have the ComfyUI workflow write the -web copy ` +
-            `(1600px longest edge, JPEG q85) alongside the master.`,
-        );
+      if (prefersDerivative && key === asset.key) {
+        // Fell back to the master. Whether that is fatal depends on the lane.
+        if (platform === "bluesky" && bytes.byteLength > MAX_BLOB_BYTES) {
+          throw new AbortTaskRunError(
+            `No web derivative for "${asset.key}" and the master is ${bytes.byteLength} bytes, ` +
+              `over Bluesky's ${MAX_BLOB_BYTES}-byte limit. Expected to find ` +
+              `"${webDerivativeKey(asset.key)}". Have the ComfyUI workflow write the -web copy ` +
+              `(1600px longest edge, JPEG q85) alongside the master.`,
+          );
+        }
+        if ((platform === "instagram" || platform === "tiktok") && mimeType !== "image/jpeg") {
+          throw new AbortTaskRunError(
+            `No web derivative for "${asset.key}" and the master is ${mimeType}. ` +
+              `${PLATFORMS[platform].label} accepts JPEG only — this is a FORMAT limit, not a ` +
+              `size one, so a smaller PNG would not help either. Expected to find ` +
+              `"${webDerivativeKey(asset.key)}". Have the ComfyUI workflow write the -web copy.`,
+          );
+        }
       }
       return { bytes, mimeType, key };
     } catch (error) {
@@ -1730,6 +2303,28 @@ export async function fetchForPlatform(
   }
   throw new Error(
     `Could not read any of [${candidates.join(", ")}] from "${bucket}": ${String(lastError)}`,
+  );
+}
+
+/**
+ * A short-lived public link to an object, for the lanes that fetch rather than
+ * receive.
+ *
+ * Instagram and Facebook do not accept bytes — Meta's servers download the
+ * media from a URL you supply. The bucket is private, so that URL has to be
+ * presigned.
+ *
+ * The expiry is deliberately generous. Meta fetches the image during container
+ * processing, which can take a while under load, and a link that expires
+ * mid-fetch surfaces as "media download failed" with nothing pointing at the
+ * expiry. Thirty minutes costs nothing: the link is unguessable, it is for a
+ * file that is about to be posted publicly anyway, and it dies on its own.
+ */
+export async function presignedUrlFor(key: string, expiresInSeconds = 1800): Promise<string> {
+  return getSignedUrl(
+    tigrisClient,
+    new GetObjectCommand({ Bucket: HOT_BUCKET(), Key: key }),
+    { expiresIn: expiresInSeconds },
   );
 }
 
@@ -1799,10 +2394,11 @@ export const publishOne = task({
     // this is the run that actually posts.
     assertPublishAllowed(payload.platform, asset);
 
-    if (payload.platform !== "bluesky" && payload.platform !== "telegram") {
+    const supported: PlatformId[] = ["bluesky", "telegram", "instagram", "facebook", "tiktok"];
+    if (!supported.includes(payload.platform)) {
       throw new AbortTaskRunError(
-        `No adapter is built for ${payload.platform} yet. Bluesky and Telegram are live; ` +
-          `Instagram, Facebook, TikTok and YouTube are waiting on app review.`,
+        `No adapter is built for ${payload.platform}. Live lanes: ${supported.join(", ")}. ` +
+          `(YouTube was dropped from the plan.)`,
       );
     }
 
@@ -1816,6 +2412,49 @@ export const publishOne = task({
       bytes: media.bytes.byteLength,
       usedWebDerivative: media.key !== asset.key,
     });
+
+    if (payload.platform === "instagram" || payload.platform === "facebook") {
+      // Meta fetches the file itself, so it gets a link rather than the bytes.
+      // media.key is already the -web.jpg derivative where one exists.
+      const imageUrl = await presignedUrlFor(media.key);
+      const result =
+        payload.platform === "instagram"
+          ? await publishToInstagram(instagramCredentialsFromEnv(), {
+              imageUrl,
+              caption,
+              asset,
+              mimeType: media.mimeType,
+            })
+          : await publishToFacebook(facebookCredentialsFromEnv(), {
+              imageUrl,
+              caption,
+              asset,
+            });
+      logger.info(`Published to ${PLATFORMS[payload.platform].label}: ${result.url}`, {
+        id: result.id,
+        url: result.url,
+        // Never log the signed URL itself: it is a working credential for the
+        // life of its expiry.
+        sourceKey: media.key,
+      });
+      return { platform: payload.platform, id: result.id, url: result.url };
+    }
+
+    if (payload.platform === "tiktok") {
+      const result = await publishPhotoToTikTok(tiktokCredentialsFromEnv(), {
+        bytes: media.bytes,
+        mimeType: media.mimeType,
+        // TikTok's title is a short hook capped at 90 characters, so the
+        // caption is trimmed rather than sent whole.
+        title: caption.slice(0, 90),
+        description: caption,
+        asset,
+      });
+      logger.info(`Published to TikTok, publish id ${result.publishId}`, {
+        publishId: result.publishId,
+      });
+      return { platform: payload.platform, id: result.publishId, url: "" };
+    }
 
     if (payload.platform === "telegram") {
       // Telegram's photo ceiling is 10 MB against Bluesky's 1,000,000 bytes, so
@@ -1996,7 +2635,10 @@ export const publishPlanner = schedules.task({
     for (const post of plan.scheduled) {
       // Only lanes with a working adapter are dispatched. The rest are planned
       // and reported so the schedule is visible before the adapters exist.
-      if (post.platform !== "bluesky" && post.platform !== "telegram") {
+      const dispatchable: PlatformId[] = [
+        "bluesky", "telegram", "instagram", "facebook", "tiktok",
+      ];
+      if (!dispatchable.includes(post.platform)) {
         logger.info(`Planned (no adapter yet): ${post.platform} ${post.asset.key}`, {
           scheduledFor: post.scheduledFor.toISOString(),
         });

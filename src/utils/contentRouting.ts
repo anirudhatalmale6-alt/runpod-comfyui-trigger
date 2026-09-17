@@ -99,8 +99,10 @@ export const PLATFORMS: Readonly<Record<PlatformId, Platform>> = deepFreeze({
     label: "Instagram",
     accepts: ["safe"],
     media: ["image", "video"],
-    // Content Publishing API: 25 published posts per rolling 24 hours.
-    apiCeilingPerDay: 25,
+    // Content Publishing API: 100 API-published posts per rolling 24 hours.
+    // (I previously recorded 25 here from an older figure — the current docs
+    // say 100. Corrected rather than left to be discovered by a wrong refusal.)
+    apiCeilingPerDay: 100,
     adultPlatform: false,
   },
   facebook: {
