@@ -108,6 +108,22 @@ export interface Platform {
   apiCeilingPerDay?: number;
   /** True for anything that is not a mainstream social network. */
   adultPlatform: boolean;
+  /**
+   * Dropped from the plan, and never a destination again.
+   *
+   * The entry stays in the table rather than being deleted, for two reasons.
+   * This client has now dropped three platforms mid-build (X, then YouTube,
+   * then nearly Telegram), so "we are not posting there any more" is a recurring
+   * state and deserves to be a first-class one rather than a deletion each time
+   * — a deletion loses the reason, and the next question is always "did we ever
+   * support that?". And the constraints recorded here stay useful: YouTube is
+   * the only single-media platform in the table, so it is what proves the
+   * "cannot publish this kind" path actually refuses anything.
+   *
+   * A retired platform is excluded from routing, from SOCIAL_PLATFORMS, and is
+   * refused by assertPublishAllowed. It cannot be reached by asking for it.
+   */
+  retired?: boolean;
 }
 
 /**
@@ -188,6 +204,9 @@ export const PLATFORMS: Readonly<Record<PlatformId, Platform>> = deepFreeze({
     // ~1600 quota units per upload against a 10,000/day default.
     apiCeilingPerDay: 6,
     adultPlatform: false,
+    // Dropped by the client on 17 Sep 2026: "i think i will elminate youtube and
+    // just keep tiktok instagram and facebook". No adapter was ever built.
+    retired: true,
   },
   reddit: {
     id: "reddit",
@@ -230,7 +249,12 @@ export const ALL_PLATFORMS: readonly PlatformId[] = Object.freeze(
  * file it omitted turned out not to exist in the target repo.
  */
 export const SOCIAL_PLATFORMS: readonly PlatformId[] = Object.freeze(
-  ALL_PLATFORMS.filter((id) => !PLATFORMS[id].adultPlatform),
+  ALL_PLATFORMS.filter((id) => !PLATFORMS[id].adultPlatform && !PLATFORMS[id].retired),
+);
+
+/** Dropped from the plan. Kept in the table, never a destination. */
+export const RETIRED_PLATFORMS: readonly PlatformId[] = Object.freeze(
+  ALL_PLATFORMS.filter((id) => PLATFORMS[id].retired === true),
 );
 
 /** Storage prefixes that carry the classification. Exact, lowercase, no aliases. */
@@ -314,6 +338,13 @@ export function routeAsset(
       rejected.push({ platform: id, reason: `unknown platform "${id}"` });
       continue;
     }
+    if (platform.retired) {
+      rejected.push({
+        platform: id,
+        reason: `${platform.label} was dropped from the plan and is no longer a destination`,
+      });
+      continue;
+    }
     if (!platform.accepts.includes(contentClass)) {
       rejected.push({
         platform: id,
@@ -350,6 +381,13 @@ export function assertPublishAllowed(platformId: PlatformId, asset: AssetRef): v
   const platform = PLATFORMS[platformId];
   if (!platform) {
     throw new Error(`Refusing to publish: unknown platform "${platformId}".`);
+  }
+
+  if (platform.retired) {
+    throw new Error(
+      `Refusing to publish to ${platform.label}: it was dropped from the plan and is no ` +
+        `longer a destination. Key "${asset.key}".`,
+    );
   }
 
   const contentClass = classifyFromKey(asset.key);

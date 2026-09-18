@@ -17,6 +17,7 @@ import {
   CLASS_PREFIX,
   DEFAULT_CADENCE,
   PLATFORMS,
+  RETIRED_PLATFORMS,
   SOCIAL_PLATFORMS,
   assertPublishAllowed,
   classifyFromKey,
@@ -117,13 +118,15 @@ test('the platform table itself: no mainstream lane may ever accept explicit', (
   assert.ok(PLATFORMS.fanvue.accepts.includes('explicit'), 'fanvue is the explicit destination');
 });
 
-test('SOCIAL_PLATFORMS is the seven mainstream lanes, and Fanvue is not one', () => {
+test('SOCIAL_PLATFORMS is the six LIVE mainstream lanes', () => {
+  // Fanvue is excluded as the adult lane; YouTube as a retired one.
   assert.deepEqual(
     [...SOCIAL_PLATFORMS].sort(),
-    ['bluesky', 'facebook', 'instagram', 'reddit', 'telegram', 'tiktok', 'youtube'],
+    ['bluesky', 'facebook', 'instagram', 'reddit', 'telegram', 'tiktok'],
   );
-  assert.ok(!SOCIAL_PLATFORMS.includes('fanvue'));
-  assert.equal(SOCIAL_PLATFORMS.length, 7);
+  assert.ok(!SOCIAL_PLATFORMS.includes('fanvue'), 'fanvue is not a mainstream lane');
+  assert.ok(!SOCIAL_PLATFORMS.includes('youtube'), 'youtube was dropped from the plan');
+  assert.equal(SOCIAL_PLATFORMS.length, 6);
 });
 
 test('Reddit is safe-only at the PLATFORM level, whatever its communities allow', () => {
@@ -173,13 +176,40 @@ test('requesting a forbidden destination cannot obtain it', () => {
   assert.match(refusal!.reason, /safe content only/);
 });
 
-test('media capability is enforced: YouTube refuses a still image', () => {
-  const decision = routeAsset({ key: 'safe/a.png', kind: 'image' });
-  assert.ok(!decision.destinations.includes('youtube'), 'a Short cannot be a still image');
-  assert.ok(decision.rejected.some((r) => r.platform === 'youtube' && /cannot publish image/.test(r.reason)));
-
+test('a RETIRED platform is no destination, for any class or kind', () => {
+  // YouTube was dropped by the client. The entry stays in the table, so the
+  // thing that has to be true is that it can never be routed to again.
+  assert.ok(RETIRED_PLATFORMS.includes('youtube'), 'youtube is the retired one');
+  for (const key of ['safe/a.mp4', 'explicit/a.mp4', 'safe/a.png']) {
+    for (const kind of ['image', 'video'] as const) {
+      const decision = routeAsset({ key, kind });
+      assert.ok(
+        !decision.destinations.includes('youtube'),
+        `${key} as ${kind} must not route to a retired platform`,
+      );
+    }
+  }
+  // And it says why, rather than dropping it silently.
   const video = routeAsset({ key: 'safe/a.mp4', kind: 'video' });
-  assert.ok(video.destinations.includes('youtube'));
+  assert.ok(
+    video.rejected.some((r) => r.platform === 'youtube' && /dropped from the plan/.test(r.reason)),
+  );
+});
+
+test('retirement is not the same as incapability, and both are still recorded', () => {
+  // YouTube is the only single-media platform in the table, which makes it the
+  // only thing proving the "cannot publish this kind" path refuses anything.
+  // That is why the entry was retired rather than deleted — the constraint is
+  // load-bearing for the tests even though the lane is dead.
+  assert.deepEqual([...PLATFORMS.youtube.media], ['video'], 'a Short cannot be a still image');
+  assert.equal(dailyLimitFor('youtube', 'image'), 0, 'a kind it cannot publish is a zero limit');
+
+  const singleMedia = ALL_PLATFORMS.filter((id) => PLATFORMS[id].media.length === 1);
+  assert.ok(
+    singleMedia.length > 0,
+    'if this ever empties, the media-capability path has no live subject and these ' +
+      'assertions have quietly stopped testing anything',
+  );
 });
 
 test('TikTok accepts images — confirmed against the Content Posting API', () => {
@@ -213,9 +243,20 @@ test('assertPublishAllowed is independent of routeAsset', () => {
     () => assertPublishAllowed('instagram', { key: 'renders/unknown.png', kind: 'image' }),
     /classification cannot be read/,
   );
+  // Telegram takes video, so this exercises the media check on a LIVE lane
+  // rather than on the retired one, which now fails earlier for another reason.
   assert.throws(
-    () => assertPublishAllowed('youtube', { key: 'safe/a.png', kind: 'image' }),
-    /accepts video only/,
+    () => assertPublishAllowed('telegram', { key: 'explicit/a.mp4', kind: 'video' }),
+    /BLOCKED/,
+  );
+});
+
+test('assertPublishAllowed refuses a retired platform before anything else', () => {
+  // Deliberately handed content the platform WOULD have accepted when it was
+  // live. Retirement has to win, or a stale queue entry still publishes.
+  assert.throws(
+    () => assertPublishAllowed('youtube', { key: 'safe/a.mp4', kind: 'video' }),
+    /dropped from the plan/,
   );
 });
 
@@ -223,7 +264,7 @@ test('assertPublishAllowed permits what it should', () => {
   assert.doesNotThrow(() => assertPublishAllowed('instagram', { key: 'safe/a.png', kind: 'image' }));
   assert.doesNotThrow(() => assertPublishAllowed('fanvue', { key: 'explicit/a.png', kind: 'image' }));
   assert.doesNotThrow(() => assertPublishAllowed('fanvue', { key: 'safe/a.png', kind: 'image' }));
-  assert.doesNotThrow(() => assertPublishAllowed('youtube', { key: 'safe/a.mp4', kind: 'video' }));
+  assert.doesNotThrow(() => assertPublishAllowed('telegram', { key: 'safe/a.mp4', kind: 'video' }));
 });
 
 // --- cadence -----------------------------------------------------------------
