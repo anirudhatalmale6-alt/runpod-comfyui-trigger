@@ -35,11 +35,13 @@ const MODULES = [
   "src/utils/tiktokClient.ts",
   "src/utils/redditClient.ts",
   "src/utils/publishDoctor.ts",
+  "src/utils/manualPostKit.ts",
   "src/trigger/publishPipeline.ts",
   // Rides along in the SAME file rather than becoming a second thing to paste.
   // Trigger.dev discovers every exported task in a file, so one paste gives the
   // client publish-one, publish-planner, copy-asset AND publish-doctor.
   "src/trigger/publishDoctorTask.ts",
+  "src/trigger/manualPostKitTask.ts",
 ];
 
 /**
@@ -143,15 +145,22 @@ const header = `/**
  * @aws-sdk/client-s3, which this project already has, plus your own
  * utils/storageClient and utils/env.
  *
- * It registers two tasks:
+ * It registers five tasks:
  *
  *   publish-planner   hourly cron. Lists new renders in Tigris, routes them
  *                     through the safety rail, assigns staggered slots inside
  *                     your posting window, and queues one delayed job each.
  *
  *   publish-one       wakes at its slot, re-checks the rail, and publishes.
- *                     Bluesky and Telegram are live; the other lanes abort
- *                     with a clear message until their adapters exist.
+ *
+ *   copy-asset        moves a render under safe/ or explicit/ server-side,
+ *                     refusing any destination outside those two.
+ *
+ *   publish-doctor    checks every lane's credentials WITHOUT posting, and
+ *                     says which are ready, broken, or not set up.
+ *
+ *   manual-post-kit   the newest SAFE renders as time-limited download links,
+ *                     for the lanes that are posted by hand.
  *
  * Environment variables it reads (Trigger.dev > Environment Variables, and
  * remember they are PER ENVIRONMENT):
