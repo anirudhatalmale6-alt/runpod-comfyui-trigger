@@ -200,11 +200,34 @@ test('the access token never appears in an error message', () => {
   }
 });
 
+test('code 190 is split by CAUSE, because the fixes are different', () => {
+  // Observed live: "Cannot parse access token". The first version of this
+  // function answered every 190 with expiry guidance, which sent the client to
+  // check token age when the value was simply not a token. Three causes, three
+  // messages.
+  const cannotParse = describeMetaError('create media container', 400, {
+    error: { code: 190, message: 'Invalid OAuth access token - Cannot parse access token' },
+  });
+  assert.match(cannotParse, /could not PARSE/);
+  assert.match(cannotParse, /App ID and App Secret/, 'names the actual usual cause');
+  assert.ok(!/expire in about an hour/.test(cannotParse), 'must NOT blame expiry');
+
+  const expired = describeMetaError('x', 400, {
+    error: { code: 190, message: 'Error validating access token: Session has expired' },
+  });
+  assert.match(expired, /has EXPIRED/);
+  assert.match(expired, /long-lived/);
+  assert.ok(!/could not PARSE/.test(expired));
+
+  // An unrecognised 190 must still be useful rather than falling back to a
+  // guess about which cause it was.
+  const other = describeMetaError('x', 400, {
+    error: { code: 190, message: 'Session invalidated' },
+  });
+  assert.match(other, /cannot parse.*wrong or truncated VALUE/is);
+});
+
 test('Meta error codes are translated into causes, not passed through', () => {
-  assert.match(
-    describeMetaError('x', 400, { error: { code: 190, message: 'Invalid OAuth' } }),
-    /expire in about an hour/,
-  );
   assert.match(
     describeMetaError('x', 403, { error: { code: 200, message: 'Permissions error' } }),
     /PERMISSIONS problem, not a bad request/,
@@ -268,7 +291,17 @@ test('LIVE: graph.facebook.com parses our request and rejects the TOKEN', async 
   assert.equal(body.error?.code, 190, `expected OAuth code 190, got ${body.error?.code}`);
   assert.match(String(body.error?.type), /OAuthException/);
 
-  // And our formatter turns that into something actionable.
+  // Meta's exact wording for a garbage token, confirmed live rather than
+  // assumed. This is the same string the client's real INSTAGRAM_ACCESS_TOKEN
+  // produced, which is what identified the value as not-a-token rather than an
+  // expired one.
+  assert.match(String(body.error?.message), /Cannot parse access token/);
+
+  // And our formatter routes it to the PARSE branch, not the expiry branch.
   const message = describeMetaError('me', response.status, body as never);
-  assert.match(message, /access token is invalid or expired/);
+  assert.match(message, /could not PARSE/);
+  assert.ok(
+    !/expire in about an hour/.test(message),
+    'a bogus token must not be reported as an expiry problem',
+  );
 });

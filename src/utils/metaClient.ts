@@ -123,8 +123,24 @@ export function describeMetaError(
     (error.error_subcode !== undefined ? `/${error.error_subcode})` : error.code !== undefined ? ")" : "");
 
   if (error.code === 190) {
-    return `${base}. The access token is invalid or expired. Page tokens derived from a ` +
-      `short-lived user token expire in about an hour — you want a long-lived one.`;
+    // Code 190 covers several unrelated faults and they need different fixes.
+    // Saying "invalid or expired" for all of them sent the client looking at
+    // token expiry when Meta had actually said it could not PARSE the value —
+    // a wrong-value problem, not an aged-out one.
+    if (/cannot parse|malformed/i.test(error.message ?? "")) {
+      return `${base}. Meta could not PARSE the value as a token at all — this is not expiry, ` +
+        `an expired token says so explicitly. Either the value is truncated, or it is not a ` +
+        `token: the App ID and App Secret sit beside the token on the Meta dashboard and are ` +
+        `the usual mix-up. A real token starts with "EAA" and is 150+ characters.`;
+    }
+    if (/expired|session has expired/i.test(error.message ?? "")) {
+      return `${base}. The token has EXPIRED. Page tokens derived from a short-lived user ` +
+        `token last about an hour — exchange it for a long-lived one rather than pasting a ` +
+        `fresh short-lived token each time.`;
+    }
+    return `${base}. The token was rejected (code 190). Meta's own wording above is the useful ` +
+      `part: "cannot parse" means a wrong or truncated VALUE, "expired" means expiry, and ` +
+      `"session invalidated" means a password change or a revoked permission.`;
   }
   if (error.code === 200 || error.code === 10) {
     return `${base}. This is a PERMISSIONS problem, not a bad request. Instagram publishing ` +
