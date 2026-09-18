@@ -256,6 +256,17 @@ test('Meta error codes are translated into causes, not passed through', () => {
     describeMetaError('x', 403, { error: { code: 200, message: 'Permissions error' } }),
     /PERMISSIONS problem, not a bad request/,
   );
+  // The CHEAP fix must come before the expensive one. Leading with app review
+  // sends someone down a multi-week path for what is usually a five-minute
+  // token regeneration.
+  const permissions = describeMetaError('x', 400, {
+    error: { code: 10, message: 'Application does not have permission for this action' },
+  });
+  const tokenAdvice = permissions.indexOf('usual cause');
+  const reviewAdvice = permissions.indexOf('App review');
+  assert.ok(tokenAdvice > -1 && reviewAdvice > -1, 'both paths must be mentioned');
+  assert.ok(tokenAdvice < reviewAdvice, 'the token fix must be stated BEFORE app review');
+  assert.match(permissions, /DEVELOPMENT mode/, 'the no-review path must be named');
   assert.match(
     describeMetaError('x', 400, { error: { code: 9004, message: 'media fetch' } }),
     /presigned and short-lived/,

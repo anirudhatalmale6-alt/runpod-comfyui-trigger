@@ -1885,9 +1885,20 @@ export function describeMetaError(
       `"session invalidated" means a password change or a revoked permission.`;
   }
   if (error.code === 200 || error.code === 10) {
-    return `${base}. This is a PERMISSIONS problem, not a bad request. Instagram publishing ` +
-      `needs instagram_business_content_publish; Facebook page posting needs ` +
-      `pages_manage_posts. Both require app review and business verification.`;
+    // Ordering here matters more than it looks. This used to lead with "requires
+    // app review and business verification", which is true for PRODUCTION and
+    // sends someone down a multi-week path — when the actual cause is usually a
+    // token generated without the scope ticked, fixable in five minutes.
+    // Leading with the expensive fix is its own kind of wrong answer.
+    return `${base}. This is a PERMISSIONS problem, not a bad request — and the usual cause ` +
+      `is the TOKEN rather than the app: a token generated without the publishing scope ` +
+      `produces this even when everything else is correct. Regenerate it in Graph API ` +
+      `Explorer with the scope ticked. Instagram publishing needs instagram_content_publish ` +
+      `(for an account linked through a Facebook Page) or instagram_business_content_publish ` +
+      `(for the newer Instagram Login flow); Facebook page posting needs pages_manage_posts. ` +
+      `While the app is in DEVELOPMENT mode this works for accounts that hold a role on the ` +
+      `app, with no review needed. App review and business verification are required only to ` +
+      `serve accounts that do not hold a role, or once the app goes Live.`;
   }
   if (error.code === 100 && error.error_subcode === 33) {
     // Observed live: the client had a 16-digit id starting 1348 in
