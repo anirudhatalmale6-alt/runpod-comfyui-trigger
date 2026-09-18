@@ -310,6 +310,35 @@ test('a bot that was REMOVED is distinguished from one never added', async () =>
   assert.match(telegram.problems.join(' '), /Re-add it/);
 });
 
+test('an Instagram account in the FACEBOOK_PAGE_ID slot is caught, not renamed', async () => {
+  // A Page returns "name"; an Instagram account returns "username". The first
+  // version fell back through both, so an Instagram account in the Facebook
+  // variable reported as a happily-authenticated Page. Telling one object from
+  // another is the entire job here.
+  const { fetcher } = routedFetch([
+    [/100000000000000/, { body: { username: 'ava_ines_ai', id: '100000000000000' } }],
+    ...HAPPY,
+  ]);
+  const report = await runPublishDoctor('prod', { env: FULL_ENV, fetch: fetcher });
+  const facebook = report.lanes.find((l: any) => l.platform === 'facebook');
+
+  assert.equal(facebook.reachable, false, 'a username-only object is not a Page');
+  assert.match(facebook.detail, /wrong KIND of object/);
+  assert.match(facebook.problems.join(' '), /A Facebook Page has "name"/);
+  assert.ok(
+    !/authenticated as "ava_ines_ai"/.test(facebook.detail),
+    'must not report the Instagram handle as a working Facebook Page',
+  );
+});
+
+test('the correct field still passes normally', async () => {
+  const { fetcher } = routedFetch(HAPPY);
+  const report = await runPublishDoctor('prod', { env: FULL_ENV, fetch: fetcher });
+  const facebook = report.lanes.find((l: any) => l.platform === 'facebook');
+  assert.equal(facebook.reachable, true);
+  assert.match(facebook.detail, /Ava Ines Page/);
+});
+
 // --- Meta publishing scopes ---------------------------------------------------
 
 test('a Meta account that RESOLVES but cannot publish is reported as FAIL', async () => {

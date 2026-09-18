@@ -3316,7 +3316,26 @@ const metaCheck =
     const scopes = await metaScopes(token, fetcher);
     const scopeProblems = scopes === null ? [] : describeScopeGap(scopes, needed, label);
 
-    const name = String(body[field] ?? body.name ?? body.username ?? id);
+    // Require the field we ASKED for. Falling back through name/username was
+    // convenient and wrong: a Facebook Page returns `name`, an Instagram
+    // account returns `username`, so the fallback would happily report an
+    // Instagram account as a successfully-authenticated Facebook Page. The
+    // whole job here is telling one object apart from another, and a fallback
+    // that papers over the difference defeats it.
+    if (body[field] === undefined) {
+      return {
+        reachable: false,
+        detail: `${label} returned an object with no "${field}" — it is the wrong KIND of object.`,
+        problems: [
+          `${idVar} resolved, but the object has no "${field}" field, which means it is not a ` +
+            `${label} ${label === "Facebook" ? "Page" : "account"}. A Facebook Page has "name"; ` +
+            `an Instagram account has "username". Putting one id in the other's variable gets ` +
+            `you here.`,
+        ],
+      };
+    }
+
+    const name = String(body[field]);
     if (scopeProblems.length > 0) {
       return {
         reachable: false,
