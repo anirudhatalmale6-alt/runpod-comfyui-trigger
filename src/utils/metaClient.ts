@@ -147,6 +147,19 @@ export function describeMetaError(
       `needs instagram_business_content_publish; Facebook page posting needs ` +
       `pages_manage_posts. Both require app review and business verification.`;
   }
+  if (error.code === 100 && error.error_subcode === 33) {
+    // Observed live: the client had a 16-digit id starting 1348 in
+    // INSTAGRAM_USER_ID, which was an App or Page id. Meta's own wording lists
+    // three possible causes and commits to none, so it reads as "something is
+    // broken" rather than "that is the wrong number".
+    return `${base}. This almost always means the ID is the WRONG KIND of object — Meta ` +
+      `cannot tell a wrong id from one you lack permission to see, so it lists both. For ` +
+      `Instagram this must be the Instagram professional account id, which is a different ` +
+      `number from your App ID and from your Facebook Page ID. Find it with: ` +
+      `GET /me/accounts?fields=name,instagram_business_account — the id INSIDE ` +
+      `instagram_business_account is the one. If that field is absent, the Instagram account ` +
+      `is not linked to the Page yet.`;
+  }
   if (error.code === 4 || error.code === 17 || error.code === 32) {
     return `${base}. Rate limited by Meta. The scheduler paces posts, so this suggests ` +
       `something is retrying in a loop.`;

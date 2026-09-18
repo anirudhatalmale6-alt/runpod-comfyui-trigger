@@ -227,6 +227,30 @@ test('code 190 is split by CAUSE, because the fixes are different', () => {
   assert.match(other, /cannot parse.*wrong or truncated VALUE/is);
 });
 
+test('code 100/33 names the WRONG-ID cause instead of Meta\'s three-way shrug', () => {
+  // Meta's own text lists "does not exist, cannot be loaded due to missing
+  // permissions, or does not support this operation" and commits to none of
+  // them, so it reads as a general breakage. Observed live with an App ID in
+  // INSTAGRAM_USER_ID.
+  const message = describeMetaError('create media container', 400, {
+    error: {
+      code: 100,
+      error_subcode: 33,
+      message:
+        "Unsupported post request. Object with ID '1348657570401407' does not exist, " +
+        'cannot be loaded due to missing permissions, or does not support this operation.',
+    },
+  });
+  assert.match(message, /WRONG KIND of object/);
+  assert.match(message, /instagram_business_account/, 'names the call that finds the right id');
+  assert.match(message, /not linked to the Page/, 'covers the case where there is no IG account');
+
+  // A plain code 100 without the subcode is a different fault and must not be
+  // given this advice.
+  const plain = describeMetaError('x', 400, { error: { code: 100, message: 'Invalid parameter' } });
+  assert.ok(!/WRONG KIND of object/.test(plain));
+});
+
 test('Meta error codes are translated into causes, not passed through', () => {
   assert.match(
     describeMetaError('x', 403, { error: { code: 200, message: 'Permissions error' } }),
