@@ -80,7 +80,16 @@ function routedFetch(routes: Array<[RegExp, { status?: number; body: unknown }]>
   return { fetcher, calls };
 }
 
+const GRANTED_SCOPES = {
+  data: [
+    { permission: 'instagram_basic', status: 'granted' },
+    { permission: 'instagram_content_publish', status: 'granted' },
+    { permission: 'pages_manage_posts', status: 'granted' },
+  ],
+};
+
 const HAPPY: Array<[RegExp, { status?: number; body: unknown }]> = [
+  [/me\/permissions/, GRANTED_SCOPES],
   [/createSession/, { body: { handle: 'ava.bsky.social', did: 'did:plc:x' } }],
   [/getMe/, { body: { ok: true, result: { id: 123456, username: 'ava_ines_publish_bot' } } }],
   [/getChat\?/, { body: { ok: true, result: { title: 'Ava Ines Official', type: 'channel' } } }],
@@ -212,6 +221,89 @@ test('Telegram: a bad TOKEN is distinguished from a bad CHANNEL', async () => {
   const telegram = report.lanes.find((l: any) => l.platform === 'telegram');
   assert.match(telegram.problems.join(' '), /TELEGRAM_BOT_TOKEN is not valid/);
   assert.ok(!/channel/i.test(telegram.detail), 'must not blame the channel for a token fault');
+});
+
+// --- Meta publishing scopes ---------------------------------------------------
+
+test('a Meta account that RESOLVES but cannot publish is reported as FAIL', async () => {
+  // The trap this exists for: reading the account needs one permission and
+  // publishing needs another. Without the scope check the doctor says OK and
+  // the first real post fails — which is the whole failure mode the doctor was
+  // written to remove.
+  const { fetcher } = routedFetch([
+    [/me\/permissions/, { body: { data: [{ permission: 'instagram_basic', status: 'granted' }] } }],
+    ...HAPPY,
+  ]);
+  const report = await runPublishDoctor('prod', { env: FULL_ENV, fetch: fetcher });
+  const instagram = report.lanes.find((l: any) => l.platform === 'instagram');
+
+  assert.equal(instagram.reachable, false, 'resolving is not the same as being able to publish');
+  assert.match(instagram.detail, /CANNOT PUBLISH/);
+  assert.match(instagram.problems.join(' '), /wrong TYPE/, 'not-offered means the app type');
+});
+
+test('a DECLINED scope is distinguished from one that was never offered', async () => {
+  // Different causes, different fixes. Declined means regenerate the token and
+  // approve properly; absent means the app can never have it.
+  const { fetcher } = routedFetch([
+    [
+      /me\/permissions/,
+      { body: { data: [{ permission: 'instagram_content_publish', status: 'declined' }] } },
+    ],
+    ...HAPPY,
+  ]);
+  const report = await runPublishDoctor('prod', { env: FULL_ENV, fetch: fetcher });
+  const instagram = report.lanes.find((l: any) => l.platform === 'instagram');
+
+  assert.match(instagram.problems.join(' '), /DECLINED, not granted/);
+  assert.match(instagram.problems.join(' '), /approval dialog too quickly/);
+  assert.ok(
+    !/wrong TYPE/.test(instagram.problems.join(' ')),
+    'a declined scope is NOT an app-type problem and must not say so',
+  );
+});
+
+test('either Instagram publishing scope name satisfies the requirement', async () => {
+  // Two flows, two names. Accepting only one would report a working setup as
+  // broken for whichever flow we did not name.
+  for (const permission of ['instagram_content_publish', 'instagram_business_content_publish']) {
+    const { fetcher } = routedFetch([
+      [/me\/permissions/, { body: { data: [{ permission, status: 'granted' }] } }],
+      ...HAPPY,
+    ]);
+    const report = await runPublishDoctor('prod', { env: FULL_ENV, fetch: fetcher });
+    assert.ok(report.ready.includes('instagram'), `${permission} should satisfy the check`);
+  }
+});
+
+test('an unreadable permissions list is UNCONFIRMED, never reported as fine', async () => {
+  // A Page token cannot read /me/permissions. That is not evidence of a
+  // problem, and it is not evidence of health either — say so rather than
+  // picking whichever is convenient.
+  const { fetcher } = routedFetch([
+    [/me\/permissions/, { status: 400, body: { error: { code: 100 } } }],
+    ...HAPPY,
+  ]);
+  const report = await runPublishDoctor('prod', { env: FULL_ENV, fetch: fetcher });
+  const instagram = report.lanes.find((l: any) => l.platform === 'instagram');
+
+  assert.equal(instagram.reachable, true, 'the account did resolve, so this is not a failure');
+  assert.match(instagram.detail, /could not be checked/);
+  assert.match(instagram.detail, /unconfirmed/);
+});
+
+test('Facebook is checked against pages_manage_posts, not the Instagram scope', async () => {
+  const { fetcher } = routedFetch([
+    [
+      /me\/permissions/,
+      { body: { data: [{ permission: 'instagram_content_publish', status: 'granted' }] } },
+    ],
+    ...HAPPY,
+  ]);
+  const report = await runPublishDoctor('prod', { env: FULL_ENV, fetch: fetcher });
+  const facebook = report.lanes.find((l: any) => l.platform === 'facebook');
+  assert.equal(facebook.reachable, false, 'the Instagram scope does not authorise Facebook');
+  assert.match(facebook.problems.join(' '), /pages_manage_posts/);
 });
 
 // --- Meta and TikTok ----------------------------------------------------------

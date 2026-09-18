@@ -184,6 +184,71 @@ const telegramCheck: Check = async (env, fetcher) => {
   };
 };
 
+/**
+ * Which permissions the TOKEN actually carries.
+ *
+ * This is the check that settles a Meta permissions failure, because it
+ * distinguishes three cases that are indistinguishable from the publish error
+ * alone: granted, declined, and not-offered-at-all. The third means the app
+ * cannot ever have the permission — usually the wrong app TYPE — and no amount
+ * of re-ticking boxes will change it.
+ *
+ * Best-effort: it needs a user token, so a Page token may refuse it. A refusal
+ * is reported as "could not determine", never as "missing".
+ */
+async function metaScopes(
+  token: string,
+  fetcher: Fetcher,
+): Promise<{ granted: Set<string>; declined: Set<string> } | null> {
+  try {
+    const response = await fetcher(
+      `https://graph.facebook.com/v21.0/me/permissions?access_token=${encodeURIComponent(token)}`,
+    );
+    if (!response.ok) return null;
+    const body = (await response.json().catch(() => ({}))) as {
+      data?: Array<{ permission?: string; status?: string }>;
+    };
+    if (!Array.isArray(body.data)) return null;
+
+    const granted = new Set<string>();
+    const declined = new Set<string>();
+    for (const entry of body.data) {
+      if (!entry.permission) continue;
+      if (entry.status === "granted") granted.add(entry.permission);
+      else declined.add(entry.permission);
+    }
+    return { granted, declined };
+  } catch {
+    return null;
+  }
+}
+
+/** Either name satisfies the requirement; the flows differ, the need does not. */
+const INSTAGRAM_PUBLISH_SCOPES = ["instagram_content_publish", "instagram_business_content_publish"];
+
+function describeScopeGap(
+  scopes: { granted: Set<string>; declined: Set<string> },
+  needed: string[],
+  label: string,
+): string[] {
+  if (needed.some((scope) => scopes.granted.has(scope))) return [];
+
+  const wasDeclined = needed.filter((scope) => scopes.declined.has(scope));
+  if (wasDeclined.length > 0) {
+    return [
+      `${label}: the token HAS ${wasDeclined.join(" / ")} but it is DECLINED, not granted. ` +
+        `That happens by clicking through the Facebook approval dialog too quickly — ` +
+        `regenerate the token and approve the Page and Instagram parts explicitly.`,
+    ];
+  }
+  return [
+    `${label}: the token carries NONE of ${needed.join(" / ")}, and they were not even ` +
+      `offered. That usually means the app is the wrong TYPE — Instagram publishing needs a ` +
+      `BUSINESS app, and a Consumer app never offers the permission however many times you ` +
+      `tick it. Check App settings > Basic > App type, and that Instagram is in Products.`,
+  ];
+}
+
 const metaCheck =
   (idVar: string, tokenVar: string, field: string, label: string): Check =>
   async (env, fetcher) => {
@@ -220,8 +285,33 @@ const metaCheck =
       return { reachable: false, detail: `${label} rejected the credentials.`, problems };
     }
 
+    // The account resolves. That is NOT the same as being able to publish to
+    // it: reading an account needs instagram_basic, publishing needs a scope
+    // that is granted separately and is the usual thing missing. Checking it
+    // here turns "it failed when you tried to post" into "it will fail, and
+    // here is the reason" — before a post is ever attempted.
+    const needed = label === "Instagram" ? INSTAGRAM_PUBLISH_SCOPES : ["pages_manage_posts"];
+    const scopes = await metaScopes(token, fetcher);
+    const scopeProblems = scopes === null ? [] : describeScopeGap(scopes, needed, label);
+
     const name = String(body[field] ?? body.name ?? body.username ?? id);
-    return { reachable: true, detail: `${label} authenticated as "${name}".`, problems: [] };
+    if (scopeProblems.length > 0) {
+      return {
+        reachable: false,
+        detail: `${label} authenticated as "${name}" but CANNOT PUBLISH — the token lacks the publishing permission.`,
+        problems: scopeProblems,
+      };
+    }
+
+    const caveat =
+      scopes === null
+        ? " Publishing permission could not be checked from this token, so it is unconfirmed."
+        : "";
+    return {
+      reachable: true,
+      detail: `${label} authenticated as "${name}".${caveat}`,
+      problems: [],
+    };
   };
 
 const tiktokCheck: Check = async (env, fetcher) => {
