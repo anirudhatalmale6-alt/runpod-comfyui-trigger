@@ -149,7 +149,7 @@ export function subredditConfig(name: string): SubredditConfig {
   return found;
 }
 
-function requireVars(env: NodeJS.ProcessEnv, names: string[]): Record<string, string> {
+function requireRedditVars(env: NodeJS.ProcessEnv, names: string[]): Record<string, string> {
   const found: Record<string, string> = {};
   const missing: string[] = [];
   for (const name of names) {
@@ -180,7 +180,7 @@ export function defaultUserAgent(username: string): string {
 export function redditCredentialsFromEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): RedditCredentials {
-  const vars = requireVars(env, [
+  const vars = requireRedditVars(env, [
     "REDDIT_CLIENT_ID",
     "REDDIT_CLIENT_SECRET",
     "REDDIT_USERNAME",

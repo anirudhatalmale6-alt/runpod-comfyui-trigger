@@ -72,4 +72,60 @@ test('the bundle needs no dependency the project does not already have', () => {
     bundle.includes('getSignedUrl'),
     'Instagram and Facebook need presigned URLs; the bundle must import the presigner',
   );
+
+  // One statement per specifier. Two task files both import the SDK, and when
+  // the bundler concatenated their imports instead of merging them the bundle
+  // declared `logger` and `task` twice — a SyntaxError that would have surfaced
+  // on the client's deploy rather than here.
+  assert.equal(
+    new Set(imports).size,
+    imports.length,
+    `a specifier is imported more than once: ${imports.join(', ')}`,
+  );
+});
+
+test('the bundle actually PARSES, which text matching cannot tell you', async () => {
+  // The duplicate-import bug produced a bundle that satisfied every string
+  // assertion above and still could not load. The only way to know a generated
+  // file is valid is to hand it to the engine.
+  const bundle = readFileSync(bundlePath, 'utf8');
+
+  // Stub the two imports that resolve inside the CLIENT's repo, not this one,
+  // plus the SDK. Everything else must stand on its own.
+  const runnable = bundle
+    .replace(/^import \{[^}]*\} from "\.\.\/utils\/env\.js";$/m, 'const requireEnv = (n: string) => n;')
+    .replace(
+      /^import \{[^}]*\} from "\.\.\/utils\/storageClient\.js";$/m,
+      'const tigrisClient: any = null;',
+    )
+    .replace(
+      /^import \{([^}]*)\} from "@trigger\.dev\/sdk\/v3";$/m,
+      'const logger: any = { info() {}, warn() {}, error() {} };\n' +
+        'const task: any = (d: any) => d;\n' +
+        'const schedules: any = { task: (d: any) => d };\n' +
+        'class AbortTaskRunError extends Error {}',
+    )
+    .replace(/^import \{[^}]*\} from "@aws-sdk\/[^"]*";$/gm, '');
+
+  assert.ok(!/^import /m.test(runnable), 'every import should now be stubbed');
+  // Prove the stubbing did not gut the file before trusting a clean parse.
+  assert.ok(runnable.includes('assertPublishAllowed'), 'the rail must survive stubbing');
+  assert.ok(runnable.includes('"publish-doctor"'), 'the doctor task must survive stubbing');
+
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const dir = mkdtempSync(join(tmpdir(), 'standalone-parse-'));
+  try {
+    const file = join(dir, 'bundle.ts');
+    writeFileSync(file, runnable);
+    // A duplicate declaration, an unbalanced brace or a stray specifier all
+    // throw here. Missing AWS commands only matter at call time, so an import
+    // is enough to prove the file is syntactically whole.
+    const mod = await import(file);
+    assert.ok(mod, 'the bundle loaded');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

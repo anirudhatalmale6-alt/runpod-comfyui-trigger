@@ -26,6 +26,7 @@ const root = join(here, "..");
 /** Order matters: each file may only depend on ones already above it. */
 const MODULES = [
   "src/utils/contentRouting.ts",
+  "src/utils/envReport.ts",
   "src/utils/captionGenerator.ts",
   "src/utils/publishScheduler.ts",
   "src/utils/blueskyClient.ts",
@@ -33,7 +34,12 @@ const MODULES = [
   "src/utils/metaClient.ts",
   "src/utils/tiktokClient.ts",
   "src/utils/redditClient.ts",
+  "src/utils/publishDoctor.ts",
   "src/trigger/publishPipeline.ts",
+  // Rides along in the SAME file rather than becoming a second thing to paste.
+  // Trigger.dev discovers every exported task in a file, so one paste gives the
+  // client publish-one, publish-planner, copy-asset AND publish-doctor.
+  "src/trigger/publishDoctorTask.ts",
 ];
 
 /**
@@ -60,8 +66,47 @@ const EXTERNAL = [
 const sections = [];
 /** Relative specifiers that were stripped, to be checked against MODULES. */
 const stripped_specifiers = new Set();
-/** Import statements for non-inlined modules, hoisted to the top verbatim. */
-const externalImports = new Set();
+/**
+ * Bindings for non-inlined modules, collected PER SPECIFIER and merged.
+ *
+ * This used to dedupe whole import statements by exact text, which worked only
+ * while exactly one source file imported any given external module. The moment
+ * a second task file imported @trigger.dev/sdk/v3 with a different set of
+ * bindings, both statements survived — and since they share `logger` and `task`
+ * the bundle became a duplicate-declaration SyntaxError that would have failed
+ * on deploy, not here.
+ *
+ * So: union the bindings and emit one statement per specifier. Type-only
+ * imports are kept separate from value imports rather than folded together,
+ * because `verbatimModuleSyntax` makes that distinction load-bearing.
+ */
+const externalImports = new Map();
+
+function recordExternalImport(specifier, isTypeOnly, bindingText) {
+  if (!externalImports.has(specifier)) {
+    externalImports.set(specifier, { value: new Set(), type: new Set() });
+  }
+  const entry = externalImports.get(specifier);
+  const target = isTypeOnly ? entry.type : entry.value;
+  for (const binding of bindingText.split(",")) {
+    const trimmed = binding.trim();
+    // A trailing comma in the source leaves an empty segment.
+    if (trimmed !== "") target.add(trimmed);
+  }
+}
+
+function renderExternalImports() {
+  const lines = [];
+  for (const [specifier, { value, type }] of externalImports) {
+    if (value.size > 0) {
+      lines.push(`import { ${[...value].join(", ")} } from "${specifier}";`);
+    }
+    if (type.size > 0) {
+      lines.push(`import type { ${[...type].join(", ")} } from "${specifier}";`);
+    }
+  }
+  return lines;
+}
 
 for (const relative of MODULES) {
   const source = readFileSync(join(root, relative), "utf8");
@@ -69,12 +114,12 @@ for (const relative of MODULES) {
   // Drop every import of a module that is being inlined. Matches both single
   // line and multi-line forms. Anything in KEEP is re-added at the top instead.
   const stripped = source.replace(
-    /^import\s+(?:type\s+)?\{[\s\S]*?\}\s+from\s+["']([^"']+)["'];\s*$/gm,
-    (match, specifier) => {
+    /^import\s+(type\s+)?\{([\s\S]*?)\}\s+from\s+["']([^"']+)["'];\s*$/gm,
+    (match, typeKeyword, bindings, specifier) => {
       if (EXTERNAL.includes(specifier)) {
-        // Hoisted VERBATIM, so the bindings are always whatever the source
-        // actually imports today. Deduped by exact text.
-        externalImports.add(match.trim());
+        // Bindings are taken from what the source actually imports today, then
+        // merged across files so one specifier yields one statement.
+        recordExternalImport(specifier, Boolean(typeKeyword), bindings);
       } else if (specifier.startsWith(".")) {
         stripped_specifiers.add(specifier);
       }
@@ -120,7 +165,7 @@ const header = `/**
  * runs against. Edit the sources and rebuild, or the two will drift.
  */
 
-${[...externalImports].sort().join("\n")}
+${renderExternalImports().sort().join("\n")}
 `;
 
 let output = `${header}\n${sections.join("\n\n")}\n`;
@@ -210,8 +255,15 @@ writeFileSync(target, output);
 {
   const declarations = new Map();
   const collisions = [];
+  // `export` is OPTIONAL in this pattern, and that is the fix for a real bug:
+  // metaClient and redditClient each had a PRIVATE `requireVars` helper. Both
+  // were invisible to an export-only check, both landed in one file, and the
+  // bundle became "Identifier 'requireVars' has already been declared" — a
+  // SyntaxError that every string-matching test in the suite passed straight
+  // over, and which would have surfaced on the client's deploy. Module privacy
+  // stops existing the moment two modules become one file.
   for (const match of output.matchAll(
-    /^export\s+(?:async\s+)?(?:function|const|class)\s+(\w+)/gm,
+    /^(?:export\s+)?(?:async\s+)?(?:function|const|class)\s+(\w+)/gm,
   )) {
     const name = match[1];
     declarations.set(name, (declarations.get(name) ?? 0) + 1);
@@ -221,7 +273,7 @@ writeFileSync(target, output);
   }
   if (collisions.length > 0) {
     console.error(
-      `BUILD FAILED — duplicate top-level export(s) across inlined modules:\n  ${collisions.join("\n  ")}\n` +
+      `BUILD FAILED — duplicate top-level declaration(s) across inlined modules:\n  ${collisions.join("\n  ")}\n` +
         `Rename one at the source. These are not collapsed automatically because a shared name ` +
         `with different behaviour would silently resolve to whichever module comes last.`,
     );
@@ -252,10 +304,16 @@ if (missing.length > 0) {
 // regex, which happily matched from the first import all the way down to the
 // first relative one and reported three false failures. A guard that cries
 // wolf gets disabled, so it is worth getting right.
+// Checked by SPECIFIER rather than by matching the whole statement text. The
+// statement-text version silently stopped working the moment imports began
+// being merged, and reported every legitimate external as unresolved.
 const unexpected = output
   .split("\n")
   .filter((line) => /^import\b/.test(line) && /from\s+["']\./.test(line))
-  .filter((line) => !externalImports.has(line.trim()));
+  .filter((line) => {
+    const specifier = /from\s+["']([^"']+)["']/.exec(line)?.[1];
+    return specifier === undefined || !externalImports.has(specifier);
+  });
 if (unexpected.length > 0) {
   console.error(`BUILD FAILED — unresolved relative import(s):\n${unexpected.join("\n")}`);
   process.exit(1);
