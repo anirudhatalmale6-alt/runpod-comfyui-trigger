@@ -3011,6 +3011,67 @@ function configProblems(vars: VarReport[], environmentType: string): string[] {
   return problems;
 }
 
+/**
+ * What a credential should roughly LOOK like.
+ *
+ * Added after a real run: the report showed FACEBOOK_PAGE_ACCESS_TOKEN at 32
+ * characters and TIKTOK_ACCESS_TOKEN at 16. Both are far too short to be
+ * tokens, and both had been wrong all along — but the doctor printed the
+ * lengths without comment and it took a human noticing to spot it. A number
+ * nobody knows how to interpret is not a diagnostic.
+ *
+ * Length only. Never the value. These are deliberately loose bounds — the point
+ * is catching an App Secret or a placeholder pasted into a token field, not
+ * validating a format that the platform may change.
+ */
+const VALUE_SHAPES: Readonly<Record<string, { minLength: number; hint: string }>> = Object.freeze({
+  INSTAGRAM_ACCESS_TOKEN: {
+    minLength: 100,
+    hint: "a Meta access token is normally 150-300 characters",
+  },
+  FACEBOOK_PAGE_ACCESS_TOKEN: {
+    minLength: 100,
+    hint: "a Meta page access token is normally 150-300 characters",
+  },
+  TIKTOK_ACCESS_TOKEN: {
+    minLength: 50,
+    hint: "a TikTok access token is well over 100 characters",
+  },
+  REDDIT_CLIENT_SECRET: { minLength: 20, hint: "a Reddit app secret is around 27-30 characters" },
+  BLUESKY_APP_PASSWORD: { minLength: 19, hint: "an app password is xxxx-xxxx-xxxx-xxxx" },
+  TELEGRAM_BOT_TOKEN: { minLength: 40, hint: "a bot token is <digits>:<35+ character secret>" },
+});
+
+/** Exactly 32 characters of hex is a Meta App Secret, not a token. */
+const META_TOKEN_VARS = ["INSTAGRAM_ACCESS_TOKEN", "FACEBOOK_PAGE_ACCESS_TOKEN"];
+
+export function shapeProblems(vars: VarReport[]): string[] {
+  const problems: string[] = [];
+  for (const report of vars) {
+    if (!report.present || report.blank) continue;
+    const shape = VALUE_SHAPES[report.name];
+    if (!shape) continue;
+
+    if (report.length >= shape.minLength) continue;
+
+    if (META_TOKEN_VARS.includes(report.name) && report.length === 32) {
+      problems.push(
+        `${report.name} is exactly 32 characters, which is the length of a Meta APP SECRET, ` +
+          `not an access token. They sit next to each other on the dashboard. This will never ` +
+          `work as a token, however many times it is retried.`,
+      );
+      continue;
+    }
+
+    problems.push(
+      `${report.name} is only ${report.length} characters — too short to be valid, because ` +
+        `${shape.hint}. This looks like the wrong value rather than an expired one, so ` +
+        `regenerating it will not help until the right value is in there.`,
+    );
+  }
+  return problems;
+}
+
 type Check = (
   env: NodeJS.ProcessEnv,
   fetcher: Fetcher,
@@ -3075,10 +3136,45 @@ const telegramCheck: Check = async (env, fetcher) => {
     `${api}/bot${token}/getChatMember?chat_id=${encodeURIComponent(chatId)}&user_id=${bot.id ?? 0}`,
   );
   const member = await readJson(memberResponse);
-  const status = String(
-    ((member.result ?? {}) as { status?: string }).status ?? "unknown",
-  );
+
+  // A FAILED getChatMember is not a membership status. The first version
+  // defaulted a missing status to "unknown" and then reported the bot as
+  // 'a "unknown" in the channel, not an admin' — which reads like the bot is
+  // present with a strange role, when in fact Telegram refused the question.
+  //
+  // The distinction is real and it matters here: getChat succeeds for any
+  // PUBLIC channel whether or not the bot is in it, so seeing the channel name
+  // come back proves nothing about membership. getChatMember is the call that
+  // actually knows, and when it fails the honest answer is "not in the channel",
+  // not an invented role.
+  if (!memberResponse.ok || member.ok !== true) {
+    problems.push(
+      `${botName} is NOT in ${chatId}. Telegram could read the channel's details — that ` +
+        `works for any public channel — but refused to report the bot's membership, which ` +
+        `means it has never been added. Add it from the BOT's profile: open the bot, tap ` +
+        `its name, "Add to Group or Channel", then enable "Post Messages".`,
+    );
+    return {
+      reachable: false,
+      detail: `${botName} is not a member of "${chatInfo.title ?? chatId}".`,
+      problems,
+    };
+  }
+
+  const status = String(((member.result ?? {}) as { status?: string }).status ?? "unknown");
   const canPost = ((member.result ?? {}) as { can_post_messages?: boolean }).can_post_messages;
+
+  if (status === "left" || status === "kicked") {
+    problems.push(
+      `${botName} was in ${chatId} but is now "${status}" — removed or never accepted. ` +
+        `Re-add it as an administrator with "Post Messages" enabled.`,
+    );
+    return {
+      reachable: false,
+      detail: `${botName} has been ${status} from "${chatInfo.title ?? chatId}".`,
+      problems,
+    };
+  }
 
   if (status !== "administrator" && status !== "creator") {
     problems.push(
@@ -3422,6 +3518,11 @@ export async function checkLane(
   const vars = missingVars(lane.vars, env);
   const problems = configProblems(vars, environmentType);
   const configured = problems.length === 0;
+
+  // Shape problems do NOT make a lane unconfigured — the value is present, it
+  // is just wrong. Keeping them separate means the live check still runs and
+  // the platform's own verdict still gets reported alongside our suspicion.
+  problems.push(...shapeProblems(vars));
 
   const base: LaneStatus = {
     platform: lane.platform,

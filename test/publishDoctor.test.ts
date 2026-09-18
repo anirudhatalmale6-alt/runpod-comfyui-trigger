@@ -223,6 +223,93 @@ test('Telegram: a bad TOKEN is distinguished from a bad CHANNEL', async () => {
   assert.ok(!/channel/i.test(telegram.detail), 'must not blame the channel for a token fault');
 });
 
+// --- value shape --------------------------------------------------------------
+
+test('a token too SHORT to be a token is called out, not just printed', async () => {
+  // From a real run: FACEBOOK_PAGE_ACCESS_TOKEN was 32 chars and
+  // TIKTOK_ACCESS_TOKEN was 16. The report showed both lengths and said
+  // nothing about them, so it took a human noticing. A number nobody knows how
+  // to interpret is not a diagnostic.
+  const { fetcher } = routedFetch(HAPPY);
+  const report = await runPublishDoctor('prod', {
+    env: { ...FULL_ENV, TIKTOK_ACCESS_TOKEN: 'act.short' } as NodeJS.ProcessEnv,
+    fetch: fetcher,
+  });
+  const tiktok = report.lanes.find((l: any) => l.platform === 'tiktok');
+  assert.match(tiktok.problems.join(' '), /too short to be valid/);
+  assert.match(tiktok.problems.join(' '), /wrong value rather than an expired one/);
+});
+
+test('exactly 32 characters in a Meta token field is named as an APP SECRET', async () => {
+  const { fetcher } = routedFetch(HAPPY);
+  const report = await runPublishDoctor('prod', {
+    env: { ...FULL_ENV, FACEBOOK_PAGE_ACCESS_TOKEN: 'a'.repeat(32) } as NodeJS.ProcessEnv,
+    fetch: fetcher,
+  });
+  const facebook = report.lanes.find((l: any) => l.platform === 'facebook');
+  assert.match(facebook.problems.join(' '), /APP SECRET/);
+  assert.ok(
+    !/too short to be valid/.test(facebook.problems.join(' ')),
+    'the 32-char case has its own specific message, not the generic one',
+  );
+});
+
+test('a wrong-shaped value is still CONFIGURED, so the live check still runs', async () => {
+  // "Present but wrong" must not be reported as "not set up" — that would
+  // skip the platform's own verdict and lose the more authoritative answer.
+  const { fetcher, calls } = routedFetch(HAPPY);
+  const report = await runPublishDoctor('prod', {
+    env: { ...FULL_ENV, TIKTOK_ACCESS_TOKEN: 'tiny' } as NodeJS.ProcessEnv,
+    fetch: fetcher,
+  });
+  const tiktok = report.lanes.find((l: any) => l.platform === 'tiktok');
+  assert.equal(tiktok.configured, true, 'present-but-wrong is configured, not unconfigured');
+  assert.ok(!report.unconfigured.includes('tiktok'));
+  assert.ok(calls.some((u) => /tiktokapis/.test(u)), 'the live check must still have run');
+});
+
+test('a plausible value produces no shape complaint', async () => {
+  const { fetcher } = routedFetch(HAPPY);
+  const report = await runPublishDoctor('prod', {
+    env: { ...FULL_ENV, TIKTOK_ACCESS_TOKEN: `act.${'x'.repeat(120)}` } as NodeJS.ProcessEnv,
+    fetch: fetcher,
+  });
+  const tiktok = report.lanes.find((l: any) => l.platform === 'tiktok');
+  assert.deepEqual(tiktok.problems, [], 'a normal-looking token must not be flagged');
+});
+
+// --- Telegram membership vs a refused question --------------------------------
+
+test('a FAILED getChatMember reads as "not in the channel", not an invented role', async () => {
+  // getChat succeeds for any PUBLIC channel whether or not the bot is in it,
+  // so the channel name coming back proves nothing. The first version defaulted
+  // the missing status to "unknown" and reported the bot as 'a "unknown" in the
+  // channel' — which reads as present-with-a-strange-role.
+  const { fetcher } = routedFetch([
+    [/getChatMember/, { status: 400, body: { ok: false, description: 'Bad Request: user not found' } }],
+    ...HAPPY,
+  ]);
+  const report = await runPublishDoctor('prod', { env: FULL_ENV, fetch: fetcher });
+  const telegram = report.lanes.find((l: any) => l.platform === 'telegram');
+
+  assert.equal(telegram.reachable, false);
+  assert.match(telegram.detail, /not a member of/);
+  assert.ok(!/unknown/.test(telegram.detail), 'must not invent a role');
+  assert.match(telegram.problems.join(' '), /works for any public channel/);
+  assert.match(telegram.problems.join(' '), /Add to Group or Channel/);
+});
+
+test('a bot that was REMOVED is distinguished from one never added', async () => {
+  const { fetcher } = routedFetch([
+    [/getChatMember/, { body: { ok: true, result: { status: 'kicked' } } }],
+    ...HAPPY,
+  ]);
+  const report = await runPublishDoctor('prod', { env: FULL_ENV, fetch: fetcher });
+  const telegram = report.lanes.find((l: any) => l.platform === 'telegram');
+  assert.match(telegram.detail, /has been kicked/);
+  assert.match(telegram.problems.join(' '), /Re-add it/);
+});
+
 // --- Meta publishing scopes ---------------------------------------------------
 
 test('a Meta account that RESOLVES but cannot publish is reported as FAIL', async () => {
