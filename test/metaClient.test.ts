@@ -170,8 +170,15 @@ test('a container that goes to ERROR explains what it usually means', async () =
   );
 });
 
-test('Facebook posts a page photo in ONE step, with published=true', async () => {
-  const { fetcher, calls } = scriptedFetch([{ body: { id: 'photo-1', post_id: 'page_post-1' } }]);
+test('Facebook derives the PAGE token first, then posts with it', async () => {
+  // The live failure: publishing with the system user token returned
+  //   (#200) The permission(s) publish_actions are not available
+  // which names a permission removed in 2018 and nothing to do with the real
+  // cause — a user token being used where a page token is required.
+  const { fetcher, calls } = scriptedFetch([
+    { body: { access_token: 'PAGE-TOKEN', id: '100000000000000' } },
+    { body: { id: 'photo-1', post_id: 'page_post-1' } },
+  ]);
 
   const result = await publishToFacebook(
     FB,
@@ -179,13 +186,73 @@ test('Facebook posts a page photo in ONE step, with published=true', async () =>
     { fetch: fetcher },
   );
 
-  assert.equal(calls.length, 1, 'Facebook is one call, unlike Instagram');
-  assert.match(calls[0]!.url, /\/100000000000000\/photos$/);
-  const body = new URLSearchParams(String(calls[0]!.init.body));
+  assert.equal(calls.length, 2, 'derive the page token, then publish');
+  assert.match(calls[0]!.url, /\/100000000000000\?fields=access_token/);
+
+  assert.match(calls[1]!.url, /\/100000000000000\/photos$/);
+  const body = new URLSearchParams(String(calls[1]!.init.body));
   assert.equal(body.get('url'), 'https://example.test/a.jpg');
   assert.equal(body.get('published'), 'true');
-  // post_id is the one a human can open; id is the photo object.
+  assert.equal(
+    body.get('access_token'),
+    'PAGE-TOKEN',
+    'the POST must use the DERIVED token, not the one we were handed',
+  );
   assert.equal(result.id, 'page_post-1');
+});
+
+test('Facebook falls back to the supplied token when none can be derived', async () => {
+  // A token that is ALREADY a page token gets no access_token back when asking
+  // about its own page. That is not an error and must not break publishing.
+  const { fetcher, calls } = scriptedFetch([
+    { body: { id: '100000000000000' } },
+    { body: { id: 'photo-1', post_id: 'page_post-1' } },
+  ]);
+
+  await publishToFacebook(
+    FB,
+    { imageUrl: 'https://example.test/a.jpg', caption: 'hello' },
+    { fetch: fetcher },
+  );
+
+  assert.equal(
+    new URLSearchParams(String(calls[1]!.init.body)).get('access_token'),
+    TOKEN,
+    'with nothing to derive, the original token is the right one',
+  );
+});
+
+test('a failed derivation does not abort the publish', async () => {
+  const { fetcher, calls } = scriptedFetch([
+    { status: 400, body: { error: { code: 100 } } },
+    { body: { id: 'photo-1', post_id: 'page_post-1' } },
+  ]);
+
+  const result = await publishToFacebook(
+    FB,
+    { imageUrl: 'https://example.test/a.jpg', caption: 'hello' },
+    { fetch: fetcher },
+  );
+
+  assert.equal(result.id, 'page_post-1', 'the post still goes out');
+  assert.equal(new URLSearchParams(String(calls[1]!.init.body)).get('access_token'), TOKEN);
+});
+
+test('the publish_actions error is translated into the REAL cause', () => {
+  const message = describeMetaError('publish page photo', 403, {
+    error: {
+      code: 200,
+      message:
+        'The permission(s) publish_actions are not available. It has been deprecated.',
+    },
+  });
+  assert.match(message, /IGNORE the words "publish_actions"/);
+  assert.match(message, /USER token where a PAGE token is required/);
+  assert.match(message, /fields=access_token/, 'and says how to fix it');
+  assert.ok(
+    !/Regenerate it in Graph API Explorer/.test(message),
+    'must not give the generic scope advice — that is a different fault',
+  );
 });
 
 // --- errors ------------------------------------------------------------------

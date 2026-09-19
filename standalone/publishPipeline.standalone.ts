@@ -1795,6 +1795,15 @@ export interface InstagramCredentials {
   /** The Instagram professional account id (not the Facebook page id). */
   igUserId: string;
   accessToken: string;
+  /**
+   * The linked Facebook Page id, when known.
+   *
+   * Instagram publishing has the same requirement Facebook does: it wants a
+   * PAGE access token, and a Business Manager system user token is a user
+   * token. Given this, the page token can be derived; without it we send what
+   * we were given, which is correct when that is already a page token.
+   */
+  pageId?: string;
 }
 
 export interface FacebookCredentials {
@@ -1834,7 +1843,15 @@ export function instagramCredentialsFromEnv(
         `Facebook page id — mixing those up surfaces as a permissions error, not a bad id.`,
     );
   }
-  return { igUserId: vars.INSTAGRAM_USER_ID!, accessToken: vars.INSTAGRAM_ACCESS_TOKEN! };
+  // Optional, and only used to derive a page token. Instagram still publishes
+  // without it when the supplied token is already a page token.
+  const pageId = (env.FACEBOOK_PAGE_ID ?? "").trim();
+
+  return {
+    igUserId: vars.INSTAGRAM_USER_ID!,
+    accessToken: vars.INSTAGRAM_ACCESS_TOKEN!,
+    ...(/^\d+$/.test(pageId) ? { pageId } : {}),
+  };
 }
 
 export function facebookCredentialsFromEnv(
@@ -1890,6 +1907,19 @@ export function describeMetaError(
     return `${base}. The token was rejected (code 190). Meta's own wording above is the useful ` +
       `part: "cannot parse" means a wrong or truncated VALUE, "expired" means expiry, and ` +
       `"session invalidated" means a password change or a revoked permission.`;
+  }
+  if (/publish_actions/i.test(error.message ?? "")) {
+    // Meta's most misleading error, and it cost an evening. publish_actions was
+    // removed in 2018 and nothing here has ever requested it — the real meaning
+    // is "you are publishing with a USER token where a PAGE token is required".
+    // A Business Manager system user token is a user token no matter how many
+    // page permissions it carries.
+    return `${base}. IGNORE the words "publish_actions" — that permission was removed in 2018 ` +
+      `and nothing here asks for it. Meta says this when you publish with a USER token where ` +
+      `a PAGE token is required. A Business Manager system user token IS a user token, however ` +
+      `many page permissions it holds. Derive the page token first: ` +
+      `GET /{page-id}?fields=access_token using the system user token, then publish with what ` +
+      `that returns.`;
   }
   if (error.code === 200 || error.code === 10) {
     // Ordering here matters more than it looks. This used to lead with "requires
@@ -2015,13 +2045,26 @@ export async function publishToInstagram(
     throw new Error(`Refusing to publish to Instagram: ${problems.join("; ")}`);
   }
 
+  // Same trap as Facebook: publishing wants a PAGE token, and a system user
+  // token is a user token. Derive one when the linked page id is known; keep
+  // the supplied token otherwise, since it may already be a page token.
+  const token = credentials.pageId
+    ? ((await derivePageAccessToken(
+        fetcher,
+        api,
+        version,
+        credentials.pageId,
+        credentials.accessToken,
+      )) ?? credentials.accessToken)
+    : credentials.accessToken;
+
   const container = await graphPost(
     fetcher,
     `${api}/${version}/${credentials.igUserId}/media`,
     {
       image_url: request.imageUrl,
       caption: request.caption,
-      access_token: credentials.accessToken,
+      access_token: token,
     },
     "create media container",
   );
@@ -2035,7 +2078,7 @@ export async function publishToInstagram(
   // doing real work rather than being superstition.
   for (let attempt = 0; attempt < 10; attempt += 1) {
     const statusResponse = await fetcher(
-      `${api}/${version}/${creationId}?fields=status_code,status&access_token=${encodeURIComponent(credentials.accessToken)}`,
+      `${api}/${version}/${creationId}?fields=status_code,status&access_token=${encodeURIComponent(token)}`,
     );
     const status = (await statusResponse.json().catch(() => ({}))) as {
       status_code?: string;
@@ -2056,7 +2099,7 @@ export async function publishToInstagram(
   const published = await graphPost(
     fetcher,
     `${api}/${version}/${credentials.igUserId}/media_publish`,
-    { creation_id: creationId, access_token: credentials.accessToken },
+    { creation_id: creationId, access_token: token },
     "publish media",
   );
 
@@ -2073,6 +2116,44 @@ export interface FacebookPostRequest {
 }
 
 /** Publish a single photo to a Facebook Page. One step, unlike Instagram. */
+/**
+ * Exchange whatever token we hold for the PAGE's own access token.
+ *
+ * Posting to /{page-id}/photos must be done AS THE PAGE. A page token does
+ * that; a user token does not — and a Business Manager system user token is a
+ * user token, however many page permissions it carries.
+ *
+ * Meta's refusal for this is spectacularly unhelpful:
+ *
+ *   (#200) The permission(s) publish_actions are not available.
+ *          It has been deprecated.
+ *
+ * publish_actions was removed in 2018 and nothing here ever asked for it. The
+ * real meaning is "you are trying to publish with a user token". Nothing in
+ * that message says so, which is how it cost an evening.
+ *
+ * GET /{page-id}?fields=access_token returns the page token, given a user token
+ * with pages_show_list that can see the page. Returns null when the field is
+ * absent — which is the normal answer if the caller already handed us a PAGE
+ * token, since a page token asking about its own page gets no access_token
+ * back. In that case the original token is already the right one.
+ */
+export async function derivePageAccessToken(
+  fetcher: Fetcher,
+  api: string,
+  version: string,
+  pageId: string,
+  token: string,
+): Promise<string | null> {
+  const response = await fetcher(
+    `${api}/${version}/${encodeURIComponent(pageId)}?fields=access_token&access_token=${encodeURIComponent(token)}`,
+  );
+  if (!response.ok) return null;
+  const body = (await response.json().catch(() => ({}))) as { access_token?: string };
+  const derived = (body.access_token ?? "").trim();
+  return derived === "" ? null : derived;
+}
+
 export async function publishToFacebook(
   credentials: FacebookCredentials,
   request: FacebookPostRequest,
@@ -2089,6 +2170,17 @@ export async function publishToFacebook(
     throw new Error(`Refusing to publish to Facebook: ${problems.join("; ")}`);
   }
 
+  // Use the page's own token when we can get one. Falling back to the supplied
+  // token covers the case where it IS already a page token.
+  const pageToken =
+    (await derivePageAccessToken(
+      fetcher,
+      api,
+      version,
+      credentials.pageId,
+      credentials.pageAccessToken,
+    )) ?? credentials.pageAccessToken;
+
   const result = await graphPost(
     fetcher,
     `${api}/${version}/${credentials.pageId}/photos`,
@@ -2096,7 +2188,7 @@ export async function publishToFacebook(
       url: request.imageUrl,
       caption: request.caption,
       published: "true",
-      access_token: credentials.pageAccessToken,
+      access_token: pageToken,
     },
     "publish page photo",
   );
