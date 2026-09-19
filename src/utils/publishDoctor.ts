@@ -22,7 +22,7 @@
  * nothing here is ever built from a request URL.
  */
 
-import type { PlatformId } from "./contentRouting.js";
+import { PLATFORMS, type PlatformId } from "./contentRouting.js";
 import { inspectVar, type VarReport } from "./envReport.js";
 
 export type Fetcher = typeof fetch;
@@ -598,7 +598,7 @@ const redditCheck: Check = async (env, fetcher) => {
 
 /* -------------------------------------------------------------------------- */
 
-export const LANES: readonly LaneSpec[] = Object.freeze([
+const ALL_LANES: readonly LaneSpec[] = Object.freeze([
   {
     platform: "bluesky" as PlatformId,
     label: "Bluesky",
@@ -636,6 +636,26 @@ export const LANES: readonly LaneSpec[] = Object.freeze([
     check: redditCheck,
   },
 ]);
+
+/**
+ * The lanes actually worth checking.
+ *
+ * DERIVED from the platform table rather than hand-listed, so retiring a
+ * platform removes it from the doctor automatically. Hand-maintained lists
+ * have gone stale four times on this project; this one cannot.
+ *
+ * A retired lane is not "broken" and not "unconfigured" — it is not a lane.
+ * Reporting Reddit as needing attention after the client dropped it would be
+ * noise that trains people to ignore the report.
+ */
+export const LANES: readonly LaneSpec[] = Object.freeze(
+  ALL_LANES.filter((lane) => PLATFORMS[lane.platform]?.retired !== true),
+);
+
+/** Kept for the record, so a retired lane can still be inspected deliberately. */
+export const RETIRED_LANES: readonly LaneSpec[] = Object.freeze(
+  ALL_LANES.filter((lane) => PLATFORMS[lane.platform]?.retired === true),
+);
 
 export async function checkLane(
   lane: LaneSpec,

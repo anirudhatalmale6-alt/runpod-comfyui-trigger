@@ -180,6 +180,15 @@ export const PLATFORMS: Readonly<Record<PlatformId, Platform>> = deepFreeze({
     accepts: ["safe"],
     media: ["image", "video"],
     adultPlatform: false,
+    // Dropped by the client on 19 Sep 2026. Reddit now gates API app creation
+    // behind business identity verification through Persona — a tax
+    // identification number plus a business document showing name and address.
+    // That is not a setting or a wait; it is paperwork the client reasonably
+    // declined to submit in order to automate a few posts a week.
+    //
+    // The adapter is complete and tested. If Reddit is ever verified, clearing
+    // this flag is the only change needed.
+    retired: true,
   },
   fanvue: {
     id: "fanvue",

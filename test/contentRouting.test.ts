@@ -118,15 +118,20 @@ test('the platform table itself: no mainstream lane may ever accept explicit', (
   assert.ok(PLATFORMS.fanvue.accepts.includes('explicit'), 'fanvue is the explicit destination');
 });
 
-test('SOCIAL_PLATFORMS is the six LIVE mainstream lanes', () => {
-  // Fanvue is excluded as the adult lane; YouTube as a retired one.
+test('SOCIAL_PLATFORMS is the five LIVE mainstream lanes', () => {
+  // Fanvue is excluded as the adult lane; YouTube and Reddit as retired ones.
   assert.deepEqual(
     [...SOCIAL_PLATFORMS].sort(),
-    ['bluesky', 'facebook', 'instagram', 'reddit', 'telegram', 'tiktok'],
+    ['bluesky', 'facebook', 'instagram', 'telegram', 'tiktok'],
   );
   assert.ok(!SOCIAL_PLATFORMS.includes('fanvue'), 'fanvue is not a mainstream lane');
   assert.ok(!SOCIAL_PLATFORMS.includes('youtube'), 'youtube was dropped from the plan');
-  assert.equal(SOCIAL_PLATFORMS.length, 6);
+  assert.ok(
+    !SOCIAL_PLATFORMS.includes('reddit'),
+    'reddit was dropped after Reddit began requiring business identity verification',
+  );
+  assert.equal(SOCIAL_PLATFORMS.length, 5);
+  assert.deepEqual([...RETIRED_PLATFORMS].sort(), ['reddit', 'youtube']);
 });
 
 test('Reddit is safe-only at the PLATFORM level, whatever its communities allow', () => {

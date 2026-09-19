@@ -227,6 +227,15 @@ export const PLATFORMS: Readonly<Record<PlatformId, Platform>> = deepFreeze({
     accepts: ["safe"],
     media: ["image", "video"],
     adultPlatform: false,
+    // Dropped by the client on 19 Sep 2026. Reddit now gates API app creation
+    // behind business identity verification through Persona — a tax
+    // identification number plus a business document showing name and address.
+    // That is not a setting or a wait; it is paperwork the client reasonably
+    // declined to submit in order to automate a few posts a week.
+    //
+    // The adapter is complete and tested. If Reddit is ever verified, clearing
+    // this flag is the only change needed.
+    retired: true,
   },
   fanvue: {
     id: "fanvue",
@@ -3623,7 +3632,7 @@ const redditCheck: Check = async (env, fetcher) => {
 
 /* -------------------------------------------------------------------------- */
 
-export const LANES: readonly LaneSpec[] = Object.freeze([
+const ALL_LANES: readonly LaneSpec[] = Object.freeze([
   {
     platform: "bluesky" as PlatformId,
     label: "Bluesky",
@@ -3661,6 +3670,26 @@ export const LANES: readonly LaneSpec[] = Object.freeze([
     check: redditCheck,
   },
 ]);
+
+/**
+ * The lanes actually worth checking.
+ *
+ * DERIVED from the platform table rather than hand-listed, so retiring a
+ * platform removes it from the doctor automatically. Hand-maintained lists
+ * have gone stale four times on this project; this one cannot.
+ *
+ * A retired lane is not "broken" and not "unconfigured" — it is not a lane.
+ * Reporting Reddit as needing attention after the client dropped it would be
+ * noise that trains people to ignore the report.
+ */
+export const LANES: readonly LaneSpec[] = Object.freeze(
+  ALL_LANES.filter((lane) => PLATFORMS[lane.platform]?.retired !== true),
+);
+
+/** Kept for the record, so a retired lane can still be inspected deliberately. */
+export const RETIRED_LANES: readonly LaneSpec[] = Object.freeze(
+  ALL_LANES.filter((lane) => PLATFORMS[lane.platform]?.retired === true),
+);
 
 export async function checkLane(
   lane: LaneSpec,
@@ -4273,14 +4302,12 @@ export const publishOne = task({
     // this is the run that actually posts.
     assertPublishAllowed(payload.platform, asset);
 
-    const supported: PlatformId[] = [
-      "bluesky",
-      "telegram",
-      "instagram",
-      "facebook",
-      "tiktok",
-      "reddit",
-    ];
+    // Derived, not listed: a platform retired in contentRouting drops out of
+    // here automatically. assertPublishAllowed above already refuses a retired
+    // platform, so this is belt and braces rather than the only guard.
+    const supported: PlatformId[] = (
+      ["bluesky", "telegram", "instagram", "facebook", "tiktok", "reddit"] as PlatformId[]
+    ).filter((id) => PLATFORMS[id]?.retired !== true);
     if (!supported.includes(payload.platform)) {
       throw new AbortTaskRunError(
         `No adapter is built for ${payload.platform}. Live lanes: ${supported.join(", ")}. ` +

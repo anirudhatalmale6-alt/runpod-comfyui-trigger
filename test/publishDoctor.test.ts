@@ -169,7 +169,7 @@ test('every lane green reports every platform ready', async () => {
   const report = await runPublishDoctor('prod', { env: FULL_ENV, fetch: fetcher });
   assert.deepEqual(
     [...report.ready].sort(),
-    ['bluesky', 'facebook', 'instagram', 'reddit', 'telegram', 'tiktok'],
+    ['bluesky', 'facebook', 'instagram', 'telegram', 'tiktok'],
   );
   assert.deepEqual(report.broken, []);
 });
@@ -514,16 +514,22 @@ test('TikTok reports an expired token as aged out rather than wrong', async () =
   assert.match(tiktok.problems.join(' '), /short-lived/);
 });
 
-test('Reddit: a token that is ISSUED but cannot read the account is NOT ready', async () => {
-  // "A token was issued" is not "a token that reaches anything".
-  const { fetcher } = routedFetch([
-    [/api\/v1\/me/, { status: 403, body: {} }],
-    ...HAPPY,
-  ]);
+test('a RETIRED lane is not checked at all — not broken, not unconfigured', async () => {
+  // Reddit was dropped on 19 Sep 2026. Reporting it as "needs attention"
+  // afterwards is noise, and noise is what trains people to stop reading the
+  // report. The lane list is DERIVED from the platform table, so retiring a
+  // platform removes it here with no second edit.
+  const { fetcher } = routedFetch(HAPPY);
   const report = await runPublishDoctor('prod', { env: FULL_ENV, fetch: fetcher });
-  const reddit = report.lanes.find((l: any) => l.platform === 'reddit');
-  assert.equal(reddit.reachable, false);
-  assert.match(reddit.problems.join(' '), /token was issued but/);
+
+  assert.equal(
+    report.lanes.find((l: any) => l.platform === 'reddit'),
+    undefined,
+    'a retired platform is not a lane',
+  );
+  assert.ok(!report.broken.includes('reddit'));
+  assert.ok(!report.unconfigured.includes('reddit'));
+  assert.ok(!report.ready.includes('reddit'));
 });
 
 // --- robustness ---------------------------------------------------------------

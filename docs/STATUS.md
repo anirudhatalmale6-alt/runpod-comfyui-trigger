@@ -21,9 +21,9 @@ confused repeatedly on this project and each confusion cost hours.
 | **Instagram** | 🟡 authenticated | Reports `ava_ines_ai`. Same fix applies. Never published. |
 | **Telegram** | 🟡 authenticated | Bot is an administrator of the channel and may post. Never published. |
 | **TikTok** | ❌ broken | `TIKTOK_ACCESS_TOKEN` is 16 characters; a real one is 100+. Wrong value, not expired. |
-| **Reddit** | ❌ not set up | Client id is 3 chars, secret 4 — placeholders. Username has whitespace. See `REDDIT-SETUP.md`. |
+| **Reddit** | ⛔ **RETIRED** | Dropped 19 Sep 2026. Reddit now gates API app creation behind business identity verification via Persona — tax ID plus a business document. The client declined, correctly: that is real paperwork to automate a few posts a week. The adapter is complete and tested; clearing `retired` in `contentRouting.ts` is the only change needed if Reddit is ever verified. |
 
-**Four lanes authenticate. One has ever published.** That gap is the next job.
+**Four lanes authenticate. One has ever published.** Reddit is retired; YouTube was retired earlier. That gap is the next job.
 
 ---
 
@@ -44,7 +44,8 @@ confused repeatedly on this project and each confusion cost hours.
    ```
    facebook → instagram → telegram.
 
-3. **TikTok and Reddit** credentials. Ordinary setup now; both are understood.
+3. **TikTok** credentials. `TIKTOK_ACCESS_TOKEN` is 16 characters where a real
+   one is 100+ — the wrong value, not an expired one.
 
 ---
 

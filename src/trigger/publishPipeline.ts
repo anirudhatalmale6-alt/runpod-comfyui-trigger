@@ -319,14 +319,12 @@ export const publishOne = task({
     // this is the run that actually posts.
     assertPublishAllowed(payload.platform, asset);
 
-    const supported: PlatformId[] = [
-      "bluesky",
-      "telegram",
-      "instagram",
-      "facebook",
-      "tiktok",
-      "reddit",
-    ];
+    // Derived, not listed: a platform retired in contentRouting drops out of
+    // here automatically. assertPublishAllowed above already refuses a retired
+    // platform, so this is belt and braces rather than the only guard.
+    const supported: PlatformId[] = (
+      ["bluesky", "telegram", "instagram", "facebook", "tiktok", "reddit"] as PlatformId[]
+    ).filter((id) => PLATFORMS[id]?.retired !== true);
     if (!supported.includes(payload.platform)) {
       throw new AbortTaskRunError(
         `No adapter is built for ${payload.platform}. Live lanes: ${supported.join(", ")}. ` +

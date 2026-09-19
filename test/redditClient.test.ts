@@ -325,10 +325,11 @@ test('an unclassifiable asset reaches no subreddit, opted in or not', () => {
   }
 });
 
-test('the PLATFORM rail refuses explicit content even for an opted-in subreddit', async () => {
-  // Defence in depth. PLATFORMS.reddit is safe-only today, so even a subreddit
-  // marked allowsExplicit must not get explicit material until that platform
-  // entry is widened deliberately.
+test('the PLATFORM rail refuses a RETIRED platform before anything else', async () => {
+  // Reddit was retired on 19 Sep 2026 — Reddit now gates API apps behind
+  // business identity verification and the client declined. The rail refuses
+  // retirement BEFORE it considers content class, so this fires even for a
+  // subreddit that opted into explicit material.
   const { fetcher, calls } = scriptedFetch([]);
   await assert.rejects(
     () =>
@@ -341,9 +342,24 @@ test('the PLATFORM rail refuses explicit content even for an opted-in subreddit'
         },
         { fetch: fetcher },
       ),
-    /BLOCKED/,
+    /dropped from the plan/,
   );
   assert.equal(calls.length, 0, 'no request left the process');
+});
+
+test('the adapter itself still works, so reviving Reddit is a one-line change', async () => {
+  // The rail blocks the lane; the ADAPTER is untouched and stays covered. If
+  // Reddit is ever verified, clearing `retired` is the only change — and this
+  // test is what says so honestly rather than the code merely implying it.
+  // No `asset`, so the platform rail is not consulted.
+  const { fetcher, calls } = scriptedFetch([
+    { body: { json: { errors: [], data: { name: 't3_a', id: 'a', url: 'https://reddit.test/a' } } } },
+  ]);
+  const result = await submitPost(
+    SESSION, CREDS, { subreddit: SAFE_SUB, title: 'a real title' }, { fetch: fetcher },
+  );
+  assert.equal(result.id, 'a');
+  assert.match(calls[0]!.url, /api\/submit$/);
 });
 
 // --- media upload ------------------------------------------------------------
@@ -473,7 +489,8 @@ test('publishToReddit uploads then submits, in that order', async () => {
       subreddit: SAFE_SUB,
       title: 'a title',
       media: { bytes: new Uint8Array([1, 2]), mimeType: 'image/jpeg', filename: 'a.jpg' },
-      asset: { key: 'safe/a.jpg', kind: 'image' },
+      // No `asset`: this test is about the upload-then-submit ORDER, and the
+      // platform rail now refuses Reddit outright. Retirement is covered above.
     },
     { fetch: fetcher },
   );
