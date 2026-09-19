@@ -33,7 +33,7 @@ confused repeatedly on this project and each confusion cost hours.
    ```
    curl -fL -o src/trigger/publishPipeline.standalone.ts \
      https://raw.githubusercontent.com/anirudhatalmale6-alt/runpod-comfyui-trigger/main/standalone/publishPipeline.standalone.ts
-   md5 -q src/trigger/publishPipeline.standalone.ts   # b946a898af0de8a4f3d688e7ce1bb40d
+   md5 -q src/trigger/publishPipeline.standalone.ts   # 5f28ffa6fd153d118721d5a1f61a0fc6
    ```
    then deploy.
 
