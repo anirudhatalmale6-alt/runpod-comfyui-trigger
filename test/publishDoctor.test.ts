@@ -94,8 +94,8 @@ const HAPPY: Array<[RegExp, { status?: number; body: unknown }]> = [
   [/getMe/, { body: { ok: true, result: { id: 123456, username: 'ava_ines_publish_bot' } } }],
   [/getChat\?/, { body: { ok: true, result: { title: 'Ava Ines Official', type: 'channel' } } }],
   [/getChatMember/, { body: { ok: true, result: { status: 'administrator', can_post_messages: true } } }],
-  [/17841400000000000/, { body: { username: 'avaines' } }],
-  [/100000000000000/, { body: { name: 'Ava Ines Page' } }],
+  [/17841400000000000/, { body: { username: 'avaines', media_count: 2 } }],
+  [/100000000000000/, { body: { name: 'Ava Ines Page', category: 'Public Figure' } }],
   [/open\.tiktokapis\.com/, { body: { data: { user: { display_name: 'Ava' } } } }],
   [/access_token$/, { body: { access_token: 'tok', expires_in: 3600 } }],
   [/api\/v1\/me/, { body: { name: 'avaines' } }],
@@ -310,6 +310,61 @@ test('a bot that was REMOVED is distinguished from one never added', async () =>
   assert.match(telegram.problems.join(' '), /Re-add it/);
 });
 
+test('a NAME is not proof of type: the system user id in FACEBOOK_PAGE_ID is caught', async () => {
+  // The real false pass. The doctor reported
+  //   OK Facebook: authenticated as "ava-publisher"
+  // because FACEBOOK_PAGE_ID held the SYSTEM USER's id. It resolved, it had a
+  // name, the scopes were present — so every check passed and a publish would
+  // still have gone nowhere. Nearly everything in the Graph API has a name.
+  const { fetcher } = routedFetch([
+    [/100000000000000/, { body: { name: 'ava-publisher', id: '100000000000000' } }],
+    ...HAPPY,
+  ]);
+  const report = await runPublishDoctor('prod', { env: FULL_ENV, fetch: fetcher });
+  const facebook = report.lanes.find((l: any) => l.platform === 'facebook');
+
+  assert.equal(facebook.reachable, false, 'a named non-Page must not read as OK');
+  assert.match(facebook.detail, /NOT a Facebook Page/);
+  assert.match(facebook.problems.join(' '), /category or fan_count/);
+  assert.match(facebook.problems.join(' '), /system user's id/);
+});
+
+test('a real Page passes on either category or fan_count', async () => {
+  // Not every Page returns both, so requiring both would reject working setups.
+  for (const proof of [{ category: 'Public Figure' }, { fan_count: 12 }]) {
+    const { fetcher } = routedFetch([
+      [/100000000000000/, { body: { name: 'AvaInes', ...proof } }],
+      ...HAPPY,
+    ]);
+    const report = await runPublishDoctor('prod', { env: FULL_ENV, fetch: fetcher });
+    const facebook = report.lanes.find((l: any) => l.platform === 'facebook');
+    assert.equal(facebook.reachable, true, `a Page with ${Object.keys(proof)[0]} must pass`);
+    assert.match(facebook.detail, /AvaInes/);
+  }
+});
+
+test('an Instagram account with no media_count is rejected as the wrong object', async () => {
+  const { fetcher } = routedFetch([
+    [/17841400000000000/, { body: { username: 'ava_ines_ai' } }],
+    ...HAPPY,
+  ]);
+  const report = await runPublishDoctor('prod', { env: FULL_ENV, fetch: fetcher });
+  const instagram = report.lanes.find((l: any) => l.platform === 'instagram');
+  assert.equal(instagram.reachable, false);
+  assert.match(instagram.detail, /NOT a Instagram account/);
+});
+
+test('media_count of ZERO still counts as proof', async () => {
+  // A brand new account has no posts. Testing presence, not truthiness — 0 is
+  // a perfectly good answer and `if (!body.media_count)` would reject it.
+  const { fetcher } = routedFetch([
+    [/17841400000000000/, { body: { username: 'ava_ines_ai', media_count: 0 } }],
+    ...HAPPY,
+  ]);
+  const report = await runPublishDoctor('prod', { env: FULL_ENV, fetch: fetcher });
+  assert.ok(report.ready.includes('instagram'), 'an empty account is still an account');
+});
+
 test('an Instagram account in the FACEBOOK_PAGE_ID slot is caught, not renamed', async () => {
   // A Page returns "name"; an Instagram account returns "username". The first
   // version fell back through both, so an Instagram account in the Facebook
@@ -323,8 +378,10 @@ test('an Instagram account in the FACEBOOK_PAGE_ID slot is caught, not renamed',
   const facebook = report.lanes.find((l: any) => l.platform === 'facebook');
 
   assert.equal(facebook.reachable, false, 'a username-only object is not a Page');
-  assert.match(facebook.detail, /wrong KIND of object/);
-  assert.match(facebook.problems.join(' '), /A Facebook Page has "name"/);
+  // The type-proof check now fires first and gives the more specific answer —
+  // it names what a Page must return, rather than only which field is absent.
+  assert.match(facebook.detail, /NOT a Facebook Page/);
+  assert.match(facebook.problems.join(' '), /category or fan_count/);
   assert.ok(
     !/authenticated as "ava_ines_ai"/.test(facebook.detail),
     'must not report the Instagram handle as a working Facebook Page',

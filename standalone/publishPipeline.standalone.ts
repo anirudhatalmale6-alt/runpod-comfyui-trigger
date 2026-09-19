@@ -3278,13 +3278,33 @@ function describeScopeGap(
   ];
 }
 
+/**
+ * Fields that PROVE the object is the right kind of thing.
+ *
+ * Asking for `name` is not enough, and this cost a real false pass: the doctor
+ * reported `OK Facebook: authenticated as "ava-publisher"` — the name of the
+ * SYSTEM USER, because FACEBOOK_PAGE_ID held the system user's id rather than
+ * the Page's. The id resolved, the scopes were present, so every check passed
+ * and a publish would still have gone nowhere.
+ *
+ * Nearly everything in the Graph API has a `name`. Only a Page has a category
+ * or a fan count; only an Instagram account has a media count. At least one of
+ * these must come back, or the id is pointing at the wrong kind of object.
+ */
+const PROOF_FIELDS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  Facebook: ["category", "fan_count"],
+  Instagram: ["media_count"],
+});
+
 const metaCheck =
   (idVar: string, tokenVar: string, field: string, label: string): Check =>
   async (env, fetcher) => {
     const id = (env[idVar] ?? "").trim();
     const token = (env[tokenVar] ?? "").trim();
+    const proof = PROOF_FIELDS[label] ?? [];
+    const requested = [field, ...proof].join(",");
     const response = await fetcher(
-      `https://graph.facebook.com/v21.0/${encodeURIComponent(id)}?fields=${field}&access_token=${encodeURIComponent(token)}`,
+      `https://graph.facebook.com/v21.0/${encodeURIComponent(id)}?fields=${requested}&access_token=${encodeURIComponent(token)}`,
     );
     const body = await readJson(response);
     const error = (body.error ?? {}) as { message?: string; code?: number };
@@ -3322,6 +3342,23 @@ const metaCheck =
     const needed = label === "Instagram" ? INSTAGRAM_PUBLISH_SCOPES : ["pages_manage_posts"];
     const scopes = await metaScopes(token, fetcher);
     const scopeProblems = scopes === null ? [] : describeScopeGap(scopes, needed, label);
+
+    // The object resolved and has a name — but a name proves nothing about WHAT
+    // it is. Require a field only the right kind of object carries.
+    if (proof.length > 0 && !proof.some((f) => body[f] !== undefined)) {
+      const what = label === "Facebook" ? "Facebook Page" : "Instagram account";
+      return {
+        reachable: false,
+        detail:
+          `${idVar} resolved to "${String(body[field] ?? id)}", but that is NOT a ${what}.`,
+        problems: [
+          `${idVar} points at the wrong kind of object. It resolved and it has a name, ` +
+            `which is why this looked fine — but a ${what} always returns ` +
+            `${proof.join(" or ")}, and this returned neither. Check you have not used the ` +
+            `system user's id, the app id, or the other platform's id here.`,
+        ],
+      };
+    }
 
     // Require the field we ASKED for. Falling back through name/username was
     // convenient and wrong: a Facebook Page returns `name`, an Instagram
